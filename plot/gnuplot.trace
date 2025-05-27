@@ -1,0 +1,7 @@
+set terminal pdf size 10,5
+set output "trace.pdf"
+#set yrange [0:500]
+set xrange [2553:39196]
+set grid
+plot "trace.dat" using 1:2 with lines title 'power'
+

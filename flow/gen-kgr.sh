@@ -1,0 +1,31 @@
+#!/bin/bash
+if [ "$#" -ne 4 ]; then
+    echo "Usage: gen-kgr <maxcyc> <readvcd.prm> <id> <n>"
+    exit
+fi
+
+maxcyc="$1"
+vcdprm="$(cat $2)"
+
+#   make _build/Vmldsa_wrap readvcd
+for x in `seq $4`; do
+    tmpdir="_tr_kgr-$3-$x"
+    echo "=== $tmpdir ==="
+    mkdir -p $tmpdir
+    cd $tmpdir
+    echo "tmpdir=${tmpdir}" | tee param.txt
+    echo "maxcyc=${maxcyc}" | tee -a param.txt
+    echo "vcdprm=${vcdprm}" | tee -a param.txt
+    dd if=/dev/urandom of=ent_in.dat bs=1 count=64
+    randxi=`cat /dev/urandom | tr -dc '0-9A-F' | head -c 64`
+    echo "randxi=${randxi}" | tee -a param.txt
+    python3 ../flow/mldsa-gen.py $tmpdir $randxi
+    mkfifo trace.vcd
+    ../readvcd trace.vcd $vcdprm > trace.log &
+    ../mldsa_wrap -t $maxcyc -vcd trace.vcd kgsign | tee run.log
+    gzip *.log
+    cd ..
+done
+
+# time ./flow/gen-kgr.sh 56000 flow/readvcd.prm a 1000
+

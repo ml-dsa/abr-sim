@@ -1,0 +1,8 @@
+set terminal pdf size 10,5
+set output "sign-tvla2.pdf"
+set yrange [-10:10]
+set xrange [2553:13000]
+#set xrange [2553:4553]
+set grid
+plot "sign-tvla.dat" with lines lt rgb '#008000', 4.5 lt rgb 'red' notitle,-4.5 lt rgb 'red' notitle
+

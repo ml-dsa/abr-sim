@@ -1,0 +1,11 @@
+--- adams-bridge/src/mldsa_top/rtl/mldsa_seq_prim.sv	2025-05-27 17:33:54.252318448 +0000
++++ rtl/mldsa_seq_prim.sv	2025-05-27 17:45:17.142358707 +0000
+@@ -30,6 +30,8 @@
+   output mldsa_seq_instr_t data_o
+   );
+ 
++    //  MJOS: debug address decoder
++    mldsa_seq_decode_prim dec_prim(clk, en_i, addr_i);
+ 
+ `ifdef RV_FPGA_OPTIMIZE
+     (*rom_style = "block" *) mldsa_seq_instr_t data_o_rom;
