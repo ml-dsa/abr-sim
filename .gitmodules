@@ -1,0 +1,3 @@
+[submodule "adams-bridge"]
+	path = adams-bridge
+	url = https://github.com/chipsalliance/adams-bridge.git
