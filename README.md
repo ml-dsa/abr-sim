@@ -25,7 +25,7 @@ abr-sim
 └── README.md     # this file
 ```
 
-##  Building
+### Building
 
 As a prerequisite, you will need standard C toolchains and
 [verilator](https://github.com/verilator/verilator)
@@ -34,33 +34,31 @@ As a prerequisite, you will need standard C toolchains and
 The python3 parts use pycryptodome; you may have to install it
 (`pip3 install pycryptodome`).
 
-Fetch the correct release, currently v1.0.1 (May 16, 2025) of the Adam's
-Bridge repo:
+Fetch the repo. Note that the `adams-bridge' submodule directory needs to point
+to a correct release, currently v1.0.1 (May 16, 2025):
 ```
-$ git submodule update --remote
-Submodule path 'adams-bridge': checked out '7b0417e45787c5a1550fb3a8ca152eb2862fe48b'
-$ cd adams-bridge
-$ git checkout v1.0.1
-Previous HEAD position was 7b0417e add cbd sampler implementation for MLKEM (#151)
-HEAD is now at 1cad033 [RTL] [TB] Cherry-pick stream msg bug fix from main (#148)
-$ cd ..
+$ git clone --recurse-submodules https://github.com/ml-dsa/abr-sim.git
+...
+Submodule path 'adams-bridge': checked out '1cad0334eebf66173f80500f4fc0b628f7cf3335'
 ```
 
-You're ready to build the main binaries. Verilator will take a minute to build.
+You're ready to build the main binaries, `readvcd` and `mldsa_wrap` using
+the Makefile. Verilator build will take a minute or two.
 ```
 $ make
-cp adams-bridge/src/mldsa_top/rtl/mldsa_seq_prim.sv rtl/mldsa_seq_prim.sv
+gcc -O2 -Wall -Wextra -o readvcd src/readvcd.c
+mkdir -p _build
 (..)
-verilator -Wno-WIDTH -Wno-UNOPTFLAT -Wno-LITENDIAN -Wno-CMPCONST -Wno-MULTIDRIVEN -Wno-UNPACKED --timescale 1ns/100ps --trace -CFLAGS "-DPRESI_TRACE" -Mdir _build -cc --exe \
-    --top-module mldsa_wrap -f flow/xabr_wrap.vf src/mldsa_wrap.cpp
+g++  mldsa_wrap.o verilated.o verilated_vcd_c.o verilated_threads.o Vmldsa_wrap__ALL.a    -pthread -lpthread -latomic   -o Vmldsa_wrap
+rm Vmldsa_wrap__ALL.verilator_deplist.tmp
+make[1]: Leaving directory '/home/mjos/src/abr-sim/_build'
+cp -p _build/Vmldsa_wrap mldsa_wrap
 ```
 
 ##  mldsa_wrap
 
 The executable `mldsa_wrap` provides full RTL simulation of Adam's Bridge,
 together with a wrapper that allows one to load/store files from command line.
-See below for build instructions (`make` suffices if everything is set up.)
-
 ```
 $ ./mldsa_wrap
 USAGE: mldsa_wrap [options] [operation]
