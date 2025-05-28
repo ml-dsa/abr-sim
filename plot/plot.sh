@@ -21,5 +21,5 @@ gnuplot -c gnuplot.avg2
 #	standard deviation
 cat sign.dat | awk '{print $1 "\t" $7 $11}' | tr ')' '\t' > std-fixrnd.dat 
 gnuplot -c gnuplot.std2
-
+gnuplot -c gnuplot.std-zoom
 
