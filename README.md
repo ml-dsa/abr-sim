@@ -5,7 +5,7 @@
 Pre-silicon trace generator for the
 [Adam's Bridge](https://github.com/chipsalliance/adams-bridge)
 PQC (Dilithium) hardware accelerator from Caliptra 2.0 / Chips Alliance.
-Generates a "toggle traces" (and logic signal dumps) for the
+Generates "toggle traces" (and logic signal dumps) for the
 ~40000-cycle ML-DSA-87 signing operation in under 1 minute.
 
 Dilithium is another name for
