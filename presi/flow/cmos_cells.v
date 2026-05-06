@@ -41,66 +41,11 @@ always @(posedge C, posedge S, posedge R)
         Q <= D;
 endmodule
 
-// Yosys-internal gate primitives.  Declared (* blackbox *) so write_spice
-// emits them with their canonical port order instead of falling back to
-// "Guessing order of ports" warnings.
-
-(* blackbox *) module \$_NOT_ (A, Y);
-input A;
-output Y;
-endmodule
-
-(* blackbox *) module \$_AND_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_OR_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_NAND_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_NOR_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_XOR_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_XNOR_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_ANDNOT_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_ORNOT_ (A, B, Y);
-input A, B;
-output Y;
-endmodule
-
-(* blackbox *) module \$_MUX_ (A, B, S, Y);
-input A, B, S;
-output Y;
-endmodule
-
-(* blackbox *) module \$_DFF_P_ (C, D, Q);
-input C, D;
-output Q;
-endmodule
-
-(* blackbox *) module \$_DFFSR_PPP_ (C, S, R, D, Q);
-input C, S, R, D;
-output Q;
-endmodule
+// Note: Yosys's $_NOT_, $_AND_, $_OR_, $_XOR_, $_MUX_, $_DFF_P_,
+// $_DFFSR_PPP_ etc. are produced by simplemap+dfflegalize in the gates
+// flow.  Adding `(* blackbox *) module \$_NOT_ ...` declarations here does
+// not help: they survive read_verilog as IdStrings prefixed with `\` while
+// simplemap's cells use IdStrings prefixed with `$` (auto-generated form),
+// so write_spice does not match them.  Instead `spice_to_c.py` matches the
+// empirically-verified "Guessing order of ports" output (output first,
+// then inputs in reverse insertion order).
