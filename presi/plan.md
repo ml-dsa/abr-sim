@@ -213,13 +213,22 @@ Exit criteria:
   - Run `proc; opt` (with full `opt`, not just `opt_clean`) before `techmap`. Without this fold, sv2v leaves parameter expressions like `$clog2(MLDSA_Q)+1` as runtime arithmetic, generating ~1200 spurious `$mul` cells in `abr_wrap` that techmap then expands to millions of gates.
   - Skip ABC and the BUF/NOT/NAND/NOR rewrite. Both ran out of memory on the inlined `abr_wrap`. Instead, `simplemap` + `dfflegalize` produce Yosys's gate primitives (`$_AND_`, `$_OR_`, `$_NOT_`, `$_XOR_`, `$_MUX_`, `$_DFF_P_`, `$_DFFSR_PPP_`), which `spice_to_c.py` will translate directly. The presi target needs a correct gate netlist, not optimal area.
   - Engines blackboxed at their `abr_top`-instantiation boundary: `abr_sampler_top`, `ntt_top`, `power2round_top`, `decompose`, `skencode`, `skdecode_top`, `makehint`, `norm_check_top`, `sigencode_z_top`, `pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`, `decompress_top`, plus `ntt_twiddle_lookup` (4 × 85-entry ROM). The C harness models these behaviorally; per-engine gate-level builds for leakage analysis of one engine at a time are a separate target.
-- Stage 3 is implemented. `make -C presi gate-c` runs `spice_to_c.py` over the full SPICE in ≈30 s and emits four files into `_build/`:
-  - `abr_wrap.presi_var.h` (≈125 MB) — `static presi_t <name>;` declaration per net.
-  - `abr_wrap.presi_clk.h` (≈202 MB) — one cycle update body, ≈4.3 M C statements.
-  - `abr_wrap.presi_map.csv` (≈100 MB) — SPICE→C name mapping for debugging.
-  - `abr_wrap.presi_bb.csv` (≈800 KB) — blackbox subcircuit instances and their pin connections, one row per pin (`instance, module, pin_index, spice_name, c_name`).  25 instances total: 8 `abr_1r1w_ram`, 2 `abr_1r1w_be_ram`, 14 engines (one each), and 1 `_mem_v2` (the abr_seq sequencer ROM).
+- Stage 3 is implemented. `make -C presi gate-c` runs `spice_to_c.py` over the full SPICE in ≈30 s and emits the netlist as a set of small ANSI-C translation units in `_build/`:
+  - `abr_wrap.presi_var.h` — self-contained header: `presi_t` typedef, `PRESI_0`/`PRESI_1` macros, and one `extern presi_t <name>;` per net.
+  - `abr_wrap.presi_var.c` — definitions of every netlist wire (compiled into a single ≈154 MB `.o`).
+  - `abr_wrap.presi_clk_part_NNN.c` — 32 per-part TUs, each holding `void presi_step_part_NNN(void)` with ≈135 k statements.  The split keeps gcc's working set per file at ≈3 GB instead of >12 GB for a monolithic 4.3 M-statement function (which still hadn't produced an `.o` after 5 minutes when interrupted).  Adjust via `GATE_C_PARTS` in the Makefile.
+  - `abr_wrap.presi_clk.h` — block-scope `extern` declarations + ordered `presi_step_part_NNN()` calls; included from inside the harness step function.
+  - `abr_wrap.presi_map.csv` — SPICE→C name map for debugging.
+  - `abr_wrap.presi_bb.csv` — one row per pin of every blackbox subcircuit instance (`instance, module, pin_index, spice_name, c_name`).  25 instances: 8 `abr_1r1w_ram`, 2 `abr_1r1w_be_ram`, 14 engines, 1 `_mem_v2` (the abr_seq sequencer ROM).
   Pin orders for the gate primitives match Yosys's "Guessing order of ports" output (output first, then inputs in reverse insertion order); see the comments in `spice_to_c.py`.  The `(* blackbox *)` declarations one might add to `cmos_cells.v` to avoid the warnings do not work — they get pruned by `hierarchy -check` before simplemap creates the cells.  The Makefile filters those warnings out of the gates log via `grep -v`.
-- Stage 4 is started: `presi/presi.c` has reset/cycle/AHB driver scaffolding and C SRAM allocation; what remains is wiring `abr_wrap.presi_var.h`/`.presi_clk.h` into the harness, mapping the C-name handles in `presi_bb.csv` to the SRAM and engine models, and confirming the C compiles (4.3 M statements is well past gcc's comfortable scale, so a SoT compile experiment is the next blocker).
+- Stage 4 is partly implemented.  `make -C presi -j 4 run-gates` builds the full netlist binary and runs it without crashing.  Achievements:
+  - `make -C presi -j 4` compiles `presi.c` + `presi_sram.c` + `presi_var.c` + 32 `presi_clk_part_NNN.c` files in ≈3 minutes (≈15 s per part TU; 4 parallel compiles fit comfortably in the 30 GB box).  Linking produces a ≈270 MB `presi-gates` binary.
+  - `presi.c` includes the generated `presi_var.h` to pick up the `presi_t` typedef and the `extern` declarations of all 4.4 M netlist wires; `presi_step_netlist()` `#include`s the dispatch header to call all 32 part functions in order.
+  - Running `presi-gates` completes reset + a few AHB transactions; bus reads currently return zeros because the blackbox subcircuits are still stubs.
+  What remains:
+  - Wire the SRAM `_mem_v2` and engine blackbox instances to C-side models via the pin lists in `presi_bb.csv`.  The SRAM models are already present in `presi_sram.c`; they just need to be driven by the right netlist wires each cycle.
+  - Behavioral C models for the 14 engines (start with `abr_sampler_top` and `ntt_top`).
+  - Drive top-level ports (`clk`, `rst_b`, `haddr_i`, `hwdata_i`, etc.) from the harness's `struct presi_ports` instead of the harness's local copies — the generated `extern presi_t clk;` already provides the handle.
 
 ## Initial Implementation Order
 

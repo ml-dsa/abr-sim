@@ -94,7 +94,9 @@ The plan and current status live in `presi/plan.md` (read it before extending th
 - `make -C presi sv2v` — sv2v normalize the upstream + local RTL into `_build/abr_wrap.sv2v.v`.
 - `make -C presi netlist-blackbox` — Yosys hierarchical netlist with the ten ABR SRAMs blackboxed; feeds `extract_sram_meta.py` → `_build/abr_wrap.sram.h`.
 - `make -C presi netlist-gates` — full gate-level SPICE (`_build/abr_wrap.gates.sp`, ~209 MB, ~4.1 M cells) of `abr_wrap`'s control plane. Takes ~150 s, peaks ~10 GiB. Runs `proc; opt; … ; simplemap; dfflegalize` and emits Yosys's gate primitives (`$_AND_`, `$_OR_`, `$_NOT_`, `$_XOR_`, `$_MUX_`, `$_DFF_P_`, `$_DFFSR_PPP_`) directly — no ABC, no BUF/NAND lowering.
-- `make -C presi run` — builds and runs the C harness scaffold (`presi/presi.c`); netlist-driven cycle stepping is still TODO.
+- `make -C presi gate-c` — translates the SPICE into C: a self-contained `presi_var.h`/`.c` pair (one extern + one definition per net), 32 `presi_clk_part_NNN.c` translation units splitting the 4.3 M-statement cycle update, and a `presi_bb.csv` pin map for the 25 blackbox subcircuit instances (10 SRAMs, 14 engines, 1 sequencer ROM).
+- `make -C presi -j 4 run-gates` — compiles + links the full netlist binary (≈270 MB `presi-gates`) and runs it. ≈3 min on -j 4; needs ≈3 GB per parallel cc1 (a single-function compile is impractical, hence the 32-part split). Cycle update is correct; blackbox subcircuits are still stubs so bus reads return zero.
+- `make -C presi run` — builds and runs the harness without the netlist (faster smoke test).
 
 Three load-bearing details that are easy to break:
 

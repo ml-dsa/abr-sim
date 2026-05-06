@@ -9,13 +9,17 @@
 #include "abr_wrap.sram.h"
 #include "presi_sram.h"
 
+#ifdef PRESI_HAVE_NETLIST
+/*
+ * Generated header: defines `presi_t`, the PRESI_0/PRESI_1 constants, and
+ * declares every netlist wire as `extern presi_t <name>;`.  Definitions
+ * live in abr_wrap.presi_var.c, compiled into a separate translation unit.
+ */
+#include "abr_wrap.presi_var.h"
+#else
 typedef uint8_t presi_t;
-
 #define PRESI_0 ((presi_t) 0)
 #define PRESI_1 ((presi_t) ~0)
-
-#ifdef PRESI_HAVE_NETLIST
-#include "abr_wrap.presi_var.h"
 #endif
 
 #define ABR_NAME            0x0000u
