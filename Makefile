@@ -62,6 +62,12 @@ rtl/abr_seq.sv:	adams-bridge/src/abr_top/rtl/abr_seq.sv rtl/abr_seq.sv.patch
 lint-abr: $(BUILD) $(BUILD)/xabr_wrap.vf
 	$(VERILATOR) $(VFLAGS) -Mdir $(BUILD) --lint-only \
 		--top-module abr_wrap -f $(BUILD)/xabr_wrap.vf
+
+mock-netlist: $(BUILD)/xabr_wrap.vf
+	bash flow/abr-yosys-mock.sh coarse
+
+mock-netlist-gates: $(BUILD)/xabr_wrap.vf
+	bash flow/abr-yosys-mock.sh gates
 	
 #	separate binaries
 
@@ -77,3 +83,4 @@ clean:
 	$(RM)   -f	$(READVCD) $(MLDSA_WRAP) $(ABR_WRAP) *.vcd *.dat *.log
 	$(RM)   -rf $(BUILD) _tr* */__pycache__
 	cd plot && $(MAKE) clean
+	cd presi && $(MAKE) clean

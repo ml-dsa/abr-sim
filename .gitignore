@@ -41,6 +41,7 @@ syn_out
 
 # Libraries
 *.lib
+!presi/flow/cmos_cells.lib
 *.a
 *.la
 *.lo

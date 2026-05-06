@@ -85,6 +85,23 @@ The `plot/` directory has a `plot.sh` that turns a tvla output (e.g. `tvla11k.tx
 - `doc/nist.fips.204.pdf` and `doc/nist.fips.203.pdf` are the official ML-DSA and ML-KEM specifications (cited by algorithm number and line in the FSM docs).
 - `doc/20250530-hardwear-abr.pdf` is the prior-art TVLA presentation that drove the trace generator's design.
 
+## Presi: presilicon netlist simulator (in progress)
+
+`presi/` is a parallel work-in-progress: an `xpresi`-style netlist-derived C simulator for `abr_wrap`. The Verilator flow above stays the primary trace generator; presi targets a self-contained ANSI-C executable that drives the same AHB transactions against a gate-level translation of the ABR control plane, with the heavy engines (NTT, sampler, encoders/decoders, etc.) and SRAMs modelled behaviorally in C.
+
+The plan and current status live in `presi/plan.md` (read it before extending the flow). Build entry points:
+
+- `make -C presi sv2v` — sv2v normalize the upstream + local RTL into `_build/abr_wrap.sv2v.v`.
+- `make -C presi netlist-blackbox` — Yosys hierarchical netlist with the ten ABR SRAMs blackboxed; feeds `extract_sram_meta.py` → `_build/abr_wrap.sram.h`.
+- `make -C presi netlist-gates` — full gate-level SPICE (`_build/abr_wrap.gates.sp`, ~209 MB, ~4.1 M cells) of `abr_wrap`'s control plane. Takes ~150 s, peaks ~10 GiB. Runs `proc; opt; … ; simplemap; dfflegalize` and emits Yosys's gate primitives (`$_AND_`, `$_OR_`, `$_NOT_`, `$_XOR_`, `$_MUX_`, `$_DFF_P_`, `$_DFFSR_PPP_`) directly — no ABC, no BUF/NAND lowering.
+- `make -C presi run` — builds and runs the C harness scaffold (`presi/presi.c`); netlist-driven cycle stepping is still TODO.
+
+Three load-bearing details that are easy to break:
+
+1. **Use `opt`, not `opt_clean`, after `proc`.** sv2v leaves parameter expressions like `$clog2(MLDSA_Q)+1` as runtime arithmetic. Without full `opt`, abr_wrap carries ~1200 spurious `$mul` cells that techmap then expands to millions of gates and OOMs the box.
+2. **sv2v `--top abr_wrap` inlines `abr_top` + `abr_ctrl` + `abr_mem_top`** into one flat `abr_wrap` module (they communicate via SV interfaces `abr_mem_if` / `abr_sram_if`, which sv2v collapses). They cannot be blackboxed individually. This is fine for presi — that's the layer we want gate-mapped — but it is the reason `presi/flow/gen_yosys.py`'s `ENGINE_MODULES` blackboxes engines at the `abr_top`-instantiation boundary instead.
+3. **No ABC, no BUF/NAND lowering.** Both ran the inlined abr_wrap into swap. The translator (`presi/flow/spice_to_c.py`) is expected to handle Yosys's gate primitives directly.
+
 ## Default file conventions
 
 `abr_wrap` uses fixed default filenames so scripts can chain without flags. Override any of them with the matching flag.
