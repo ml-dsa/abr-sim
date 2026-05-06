@@ -46,6 +46,15 @@ def emit_common(f, args):
     if args.mode == "gates":
         for mod in ENGINE_MODULES:
             f.write("blackbox %s\n" % mod)
+    # KNOWN WIDTH-TRUNCATION ISSUE: the blackbox above happens before
+    # hierarchy creates paramod variants, so all SRAM cell instances are
+    # forced to the *default* port widths (DEPTH=64, DATA_WIDTH=32 for
+    # abr_1r1w_ram).  write_spice then truncates the wider connections.
+    # The harness's SRAM model exercises only those low 32 data bits and
+    # 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox
+    # m:*<mod>*` to keep paramods, or skipping the blackbox so memory pass
+    # infers $mem_v2 cells) both make Yosys take 5+ minutes -- well past
+    # the 10-minute build budget.  Documented as a follow-up in plan.md.
     f.write("hierarchy -check -top %s\n" % args.top)
     f.write("proc\n")
     # opt (not opt_clean) folds parameter expressions like $clog2(Q)+1 that

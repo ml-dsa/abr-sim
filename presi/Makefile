@@ -29,6 +29,7 @@ GATES_VAR_C     := $(BUILD)/$(TOP).presi_var.c
 GATES_CLK_H     := $(BUILD)/$(TOP).presi_clk.h
 GATES_MAP       := $(BUILD)/$(TOP).presi_map.csv
 GATES_BB        := $(BUILD)/$(TOP).presi_bb.csv
+GATES_BB_WIRING := $(BUILD)/$(TOP).presi_bb_wiring.h
 GATES_STAMP     := $(BUILD)/$(TOP).gate-c.stamp
 # Cycle-update body is split across this many TUs so gcc never compiles a
 # single multi-million-statement function.  Bump if compile time per TU
@@ -90,7 +91,7 @@ $(GATES_NETLIST) $(GATES_STAT) $(GATES_JSON) $(GATES_SPICE): $(GATES_YS)
 		grep -v "no (blackbox) module for cell type" | \
 		tee $(BUILD)/$(TOP).gates.yosys.log
 
-gate-c: $(GATES_STAMP)
+gate-c: $(GATES_STAMP) $(GATES_BB_WIRING)
 
 $(GATES_STAMP): $(GATES_SPICE) $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(GATES_SPICE) \
@@ -103,6 +104,12 @@ $(GATES_STAMP): $(GATES_SPICE) $(FLOW)/spice_to_c.py
 # All gate-c outputs are produced atomically by the stamp recipe above.
 $(GATES_VAR_H) $(GATES_VAR_C) $(GATES_CLK_H) $(GATES_MAP) $(GATES_BB) $(GATES_PART_C): $(GATES_STAMP)
 	@:
+
+# Blackbox wiring header: turns presi_bb.csv pin lists into the body of
+# presi_sram_tick_all(), one block per SRAM instance.
+$(GATES_BB_WIRING): $(GATES_BB) $(SRAM_JSON) $(FLOW)/gen_blackbox_wiring.py
+	python3 $(FLOW)/gen_blackbox_wiring.py --bb $(GATES_BB) \
+		--sram-json $(SRAM_JSON) --out $@
 
 sram-meta: $(SRAM_JSON) $(SRAM_H)
 
@@ -129,7 +136,7 @@ $(GATES_VAR_O): $(GATES_VAR_C) $(GATES_VAR_H)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
 $(PRESI_GATES): $(CSRC) presi_sram.h $(SRAM_H) $(GATES_VAR_H) $(GATES_CLK_H) \
-                $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
+                $(GATES_BB_WIRING) $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
 	gcc $(CFLAGS_GATES) -o $@ $(CSRC) $(GATES_VAR_O) $(GATES_PART_O)
 
 run: $(PRESI)

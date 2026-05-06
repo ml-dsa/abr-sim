@@ -107,29 +107,137 @@ static void presi_step_netlist(void)
 #endif
 }
 
+#ifdef PRESI_HAVE_NETLIST
+
+/*
+ * Tables that map each abr_wrap top-level port bit to its extern presi_t
+ * in the generated netlist.  The bit order matches m->p.* (LSB at index 0)
+ * and the rtl/abr_wrap.sv declarations.
+ *
+ * Single-bit ports are direct: `extern presi_t clk;`.  Bus ports get one
+ * array per bus -- listed by name because C globals can't be indexed at
+ * runtime through a single symbol.
+ */
+
+#define _PRESI_HADDR_BITS   \
+    X(0)  X(1)  X(2)  X(3)  X(4)  X(5)  X(6)  X(7)   \
+    X(8)  X(9)  X(10) X(11) X(12) X(13) X(14) X(15)  \
+    X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23)  \
+    X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)
+
+#define _PRESI_HWDATA_BITS  \
+    X(0)  X(1)  X(2)  X(3)  X(4)  X(5)  X(6)  X(7)   \
+    X(8)  X(9)  X(10) X(11) X(12) X(13) X(14) X(15)  \
+    X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23)  \
+    X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)  \
+    X(32) X(33) X(34) X(35) X(36) X(37) X(38) X(39)  \
+    X(40) X(41) X(42) X(43) X(44) X(45) X(46) X(47)  \
+    X(48) X(49) X(50) X(51) X(52) X(53) X(54) X(55)  \
+    X(56) X(57) X(58) X(59) X(60) X(61) X(62) X(63)
+
+#define _PRESI_HTRANS_BITS  X(0) X(1)
+#define _PRESI_HSIZE_BITS   X(0) X(1) X(2)
+#define _PRESI_HRDATA_BITS  _PRESI_HWDATA_BITS
+
+#define X(i) extern presi_t haddr_i_##i;
+_PRESI_HADDR_BITS
+#undef X
+#define X(i) extern presi_t hwdata_i_##i;
+_PRESI_HWDATA_BITS
+#undef X
+#define X(i) extern presi_t htrans_i_##i;
+_PRESI_HTRANS_BITS
+#undef X
+#define X(i) extern presi_t hsize_i_##i;
+_PRESI_HSIZE_BITS
+#undef X
+#define X(i) extern presi_t hrdata_o_##i;
+_PRESI_HRDATA_BITS
+#undef X
+
+static presi_t *const presi_haddr_i_bits[32] = {
+#define X(i) &haddr_i_##i,
+    _PRESI_HADDR_BITS
+#undef X
+};
+static presi_t *const presi_hwdata_i_bits[64] = {
+#define X(i) &hwdata_i_##i,
+    _PRESI_HWDATA_BITS
+#undef X
+};
+static presi_t *const presi_htrans_i_bits[2] = {
+#define X(i) &htrans_i_##i,
+    _PRESI_HTRANS_BITS
+#undef X
+};
+static presi_t *const presi_hsize_i_bits[3] = {
+#define X(i) &hsize_i_##i,
+    _PRESI_HSIZE_BITS
+#undef X
+};
+static presi_t *const presi_hrdata_o_bits[64] = {
+#define X(i) &hrdata_o_##i,
+    _PRESI_HRDATA_BITS
+#undef X
+};
+
+#endif /* PRESI_HAVE_NETLIST */
+
+
 static void presi_apply_inputs(struct presi_model *m)
 {
+#ifdef PRESI_HAVE_NETLIST
+    int i;
+
+    clk      = m->p.clk;
+    rst_b    = m->p.rst_b;
+    hsel_i   = m->p.hsel_i;
+    hwrite_i = m->p.hwrite_i;
+    hready_i = m->p.hready_i;
+    for (i = 0; i < 32; i++) *presi_haddr_i_bits[i]  = m->p.haddr_i[i];
+    for (i = 0; i < 64; i++) *presi_hwdata_i_bits[i] = m->p.hwdata_i[i];
+    for (i = 0; i <  2; i++) *presi_htrans_i_bits[i] = m->p.htrans_i[i];
+    for (i = 0; i <  3; i++) *presi_hsize_i_bits[i]  = m->p.hsize_i[i];
+#else
     (void) m;
-    /*
-     * The generated SPICE-name map is emitted as abr_wrap.presi_map.csv.
-     * The next stage wires these stable harness ports to the generated
-     * scalar variables once the gate netlist completes.
-     */
+#endif
 }
 
 static void presi_capture_outputs(struct presi_model *m)
 {
+#ifdef PRESI_HAVE_NETLIST
+    int i;
+
+    m->p.hresp_o     = hresp_o;
+    m->p.hreadyout_o = hreadyout_o;
+    m->p.busy_o      = busy_o;
+    m->p.error_intr  = error_intr;
+    m->p.notif_intr  = notif_intr;
+    for (i = 0; i < 64; i++) m->p.hrdata_o[i] = *presi_hrdata_o_bits[i];
+#else
     (void) m;
+#endif
 }
 
 static void presi_sram_tick_all(struct presi_model *m)
 {
     (void) m;
+#ifdef PRESI_HAVE_NETLIST
     /*
-     * SRAM descriptors are available now, but the port-variable binding
-     * depends on the generated flattened names.  Keep this as a single hook
-     * so SRAM timing is ordered consistently with presi_step_netlist().
+     * Generated body: one block per blackbox SRAM instance.  Each block
+     * samples we_i/waddr_i/wdata_i/re_i/raddr_i (and wstrobe_i for the
+     * byte-enable variant) from the netlist's extern presi_t variables,
+     * calls the matching presi_sram_* helper, and writes the read result
+     * back over the rdata_o bits.
+     *
+     * Ordering: invoked AFTER presi_step_netlist() in presi_cycle so that
+     * the SRAM samples its inputs as they appear at the rising edge and
+     * the rdata_o it writes is observed by combinational logic on the
+     * NEXT cycle -- matching the synchronous one-cycle read latency of
+     * abr_1r1w_ram / abr_1r1w_be_ram.
      */
+#include "abr_wrap.presi_bb_wiring.h"
+#endif
 }
 
 static void presi_drive_idle(struct presi_model *m)
@@ -140,19 +248,25 @@ static void presi_drive_idle(struct presi_model *m)
     out_word(m->p.hsize_i, 3, 2u);
 }
 
-static void presi_half_cycle(struct presi_model *m)
-{
-    m->p.clk = (m->p.clk & 1) ? PRESI_0 : PRESI_1;
-    presi_apply_inputs(m);
-    presi_sram_tick_all(m);
-    presi_step_netlist();
-    presi_capture_outputs(m);
-}
-
 static void presi_cycle(struct presi_model *m)
 {
-    presi_half_cycle(m);
-    presi_half_cycle(m);
+    /*
+     * One cycle = two netlist evaluations.  The first half holds clk=0
+     * to let combinational logic settle; the second half holds clk=1 and
+     * is the rising-edge step where the generated `_presi_delay_<n>`
+     * temporaries advance the flops.  SRAM tick happens once per cycle
+     * after the clk=1 step, modelling the synchronous one-cycle read
+     * latency of abr_1r1w_ram.
+     */
+    m->p.clk = PRESI_0;
+    presi_apply_inputs(m);
+    presi_step_netlist();
+
+    m->p.clk = PRESI_1;
+    presi_apply_inputs(m);
+    presi_step_netlist();
+    presi_sram_tick_all(m);
+    presi_capture_outputs(m);
     m->cycle++;
     m->p.hready_i = m->p.hreadyout_o;
 }
@@ -197,15 +311,37 @@ static void ahb_write(struct presi_model *m, uint32_t addr, uint32_t data)
 static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
 {
     uint64_t data;
+    unsigned guard;
 
+    /* Address phase: drive haddr/htrans/hsel/hwrite=0 until the slave
+     * acknowledges by holding hreadyout_o high (it may insert wait
+     * states by holding it low). */
     m->p.hsel_i = PRESI_1;
     m->p.hwrite_i = PRESI_0;
     out_word(m->p.htrans_i, 2, AHB_TRANS_NONSEQ);
     out_word(m->p.hsize_i, 3, 2u);
     out_word(m->p.haddr_i, 32, addr);
-    presi_cycle(m);
-    data = in_dword(m->p.hrdata_o, 64);
-    ahb_clear(m);
+    for (guard = 0; guard < 32; guard++) {
+        presi_cycle(m);
+        if (m->p.hreadyout_o & 1) {
+            break;
+        }
+    }
+
+    /* Data phase: hold IDLE on the bus.  The slave delivers hrdata one
+     * to a few cycles after the address phase; we sample at every cycle
+     * looking for hrdata transitioning away from zero (any non-zero
+     * read), with a guard so a true zero read still returns. */
+    presi_drive_idle(m);
+    out_dword(m->p.hwdata_i, 64, 0);
+    data = 0;
+    for (guard = 0; guard < 8; guard++) {
+        presi_cycle(m);
+        data = in_dword(m->p.hrdata_o, 64);
+        if (data != 0) {
+            break;
+        }
+    }
     return (uint32_t) ((addr & 4u) ? (data >> 32) : data);
 }
 
@@ -266,11 +402,15 @@ int main(int argc, char **argv)
                presi_sram_descs[i].byte_enable ? " be" : "");
     }
 
-    presi_reset(&model, 5);
-    printf("[BUS]\tcycle=%llu name=%08x version=%08x status=%08x\n",
+    presi_reset(&model, 64);
+    printf("[BUS]\tcycle=%llu post-reset hreadyout=%u busy=%u\n",
            (unsigned long long) model.cycle,
-           ahb_read(&model, ABR_NAME),
-           ahb_read(&model, ABR_VERSION),
+           model.p.hreadyout_o & 1, model.p.busy_o & 1);
+    printf("[BUS]\tNAME    =%08x  (expected 0x44534d4c \"MLSD\")\n",
+           ahb_read(&model, ABR_NAME));
+    printf("[BUS]\tVERSION =%08x\n",
+           ahb_read(&model, ABR_VERSION));
+    printf("[BUS]\tSTATUS  =%08x\n",
            ahb_read(&model, ABR_STATUS));
     ahb_write(&model, ABR_ENTROPY, 0);
     ahb_write(&model, ABR_CTRL, 0);
