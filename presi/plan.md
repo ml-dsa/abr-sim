@@ -225,13 +225,11 @@ Exit criteria:
   - `presi/flow/gen_blackbox_wiring.py` reads `presi_bb.csv` plus `sram.json` and generates `_build/abr_wrap.presi_bb_wiring.h`, the body of `presi_sram_tick_all()`.  Each SRAM block samples we/waddr/wdata/re/raddr (and wstrobe for `abr_1r1w_be_ram`) from extern netlist wires, calls the matching `presi_sram_*` helper, and distributes rdata back over the rdata_o bits.  All 10 SRAMs are wired; the 14 engines and the abr_seq sequencer ROM (`_mem_v2`) are listed in the trailing comment as TODO.
   - `presi.c`'s `presi_apply_inputs` / `presi_capture_outputs` copy each abr_wrap top-level port bit between `m->p.*` (32-bit harness representation) and the matching extern `presi_t` (one per netlist bit).  The bit-arrays use a small X-macro list per bus (`haddr_i`, `hwdata_i`, `htrans_i`, `hsize_i`, `hrdata_o`).
   - `presi_cycle()` is a two-step cycle: first `presi_step_netlist()` with `clk = PRESI_0` to settle combinational, then `clk = PRESI_1` for the rising-edge step that advances flops via the generated `_presi_delay_<n>` temporaries.  SRAM tick happens once after the clk=1 step, modelling the synchronous one-cycle read latency of `abr_1r1w_ram`.  A single-step cycle returned all-zero hrdata even after long resets, which is why we keep both halves.
-  - Known limitations:
-    1. **SRAM port-width truncation.**  The pre-hierarchy `blackbox abr_1r1w_ram` keeps every SRAM cell at the *default* port widths (DEPTH=64, DATA_WIDTH=32) regardless of per-instance overrides.  `write_spice` then truncates the wider connections, so the netlist exposes only addr=6 / data=32 to each SRAM (instead of e.g. addr=10 / data=96 for `mem_inst0_bank0`).  The harness's SRAM storage stays at the full declared width so nothing is lost on reads/writes inside the C model, but the netlist itself can only exercise the low 32 data bits and 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox m:*<mod>*` to keep paramod variants, or skipping the SRAM blackbox entirely so memory pass infers `$mem_v2` cells) both push Yosys past the 10-minute build budget; documented in `gen_yosys.py` for follow-up.
-    2. **AHB read latency.**  `ahb_read()` does an address-phase loop until `hreadyout_o` then samples hrdata over up to 8 idle cycles.  Reads at addresses with bit 2 = 0 sometimes return zero where the spec says the slave should drive the value; the read at addr 0 (NAME) and reads with bit 2 = 1 (e.g. STATUS at 0x14 returns the version-string bytes from MLDSA_VERSION) work.  Likely an extra cycle of pipelining inside `abr_ahb_slv_sif`'s registered address path that the harness doesn't yet wait out.
+  - **AHB reads of all four NAME/VERSION/STATUS registers now read back the expected hardwired constants.**  After 64 reset cycles + 64 idle cycles the harness reads `MLDSA_CORE_NAME[31:0]=0x44534d4c`, `MLDSA_CORE_NAME[63:32]=0x3837412d`, `MLDSA_CORE_VERSION[31:0]=0x302e322e`, `MLDSA_CORE_VERSION[63:32]=0x00003300`, and `STATUS=1` (READY bit set).  The off-by-one register lag previously seen turned out to be a one-cycle alignment between our 2-step `presi_cycle` (which advances flops once per cycle, not twice) and `abr_ahb_slv_sif`'s registered-address pipeline.  The fix is one extra cycle of address phase in `ahb_read()`; the slave's combinational hrdata then reflects this transaction's address rather than the previous one's.
+  - Known limitation: **SRAM port-width truncation.**  The pre-hierarchy `blackbox abr_1r1w_ram` keeps every SRAM cell at the *default* port widths (DEPTH=64, DATA_WIDTH=32) regardless of per-instance overrides.  `write_spice` then truncates the wider connections, so the netlist exposes only addr=6 / data=32 to each SRAM (instead of e.g. addr=10 / data=96 for `mem_inst0_bank0`).  The harness's SRAM storage stays at the full declared width so nothing is lost on reads/writes inside the C model, but the netlist itself can only exercise the low 32 data bits and 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox m:*<mod>*` to keep paramod variants, or skipping the SRAM blackbox entirely so memory pass infers `$mem_v2` cells) both push Yosys past the 10-minute build budget; documented in `gen_yosys.py` for follow-up.
   What remains:
   - Behavioral C models for the 14 engines (start with `abr_sampler_top` and `ntt_top`).  The pin lists are in `presi_bb.csv`.
-  - C model for the abr_seq sequencer ROM (`_mem_v2`); pins also in `presi_bb.csv`.
-  - Track down the AHB read-latency quirk so all four basic registers (NAME/VERSION/CTRL/STATUS) read deterministically.
+  - C model for the abr_seq sequencer ROM (`_mem_v2`).  This is a 1024 × 88-bit ROM holding the FSM's UOPs; without it the controller can't actually execute any operation.  Yosys currently emits it as a single `$mem_v2` blackbox cell (75 pins in our gates flow); init data lives in `gates.json` and the upstream `abr_seq.sv` source.  Plan: extract the init array into a static C table indexed by `abr_prog_cntr_nxt`.
   - Fix the SRAM port-width truncation so all bits exercise correctly, ideally without doubling Yosys runtime.
 
 ## Initial Implementation Order
@@ -243,3 +241,63 @@ Exit criteria:
 5. Write the first translator and compile a reset-only C simulator.
 6. Implement the AHB harness and SRAM models.
 7. Run one deterministic AB operation end-to-end.
+
+Items 1–6 are done as of the current commit; item 7 is the Stage 5 goal
+and is gated on the engine + abr_seq ROM models below.
+
+## Where to pick up next
+
+The harness is at the point where it reads the AHB register file
+correctly but cannot execute any operation, because every blackbox
+subcircuit beyond the SRAMs is still a stub.  In rough priority:
+
+1. **abr_seq sequencer ROM (`_mem_v2`).**  Single instance, 1024 × 88-bit
+   ROM holding the FSM's UOPs.  The pin list is in `presi_bb.csv`
+   (75 pins: ~61 used data_o_rom bits + 10-bit address `abr_prog_cntr_nxt`
+   + 1 control + clk + 0s + 1s; some output bits were optimised away by
+   Yosys's `opt`).  Init data is in `_build/abr_wrap.gates.json` under
+   the cell's `INIT` parameter — extract it into a static `uint32_t
+   abr_seq_rom[1024][3]` table and add a wiring block in
+   `gen_blackbox_wiring.py` that, on each cycle, reads
+   `abr_prog_cntr_nxt`, looks up the entry, and drives the `data_o_rom`
+   bits that actually appear in the netlist.  Without this the
+   controller has nothing to fetch when MLDSA_CTRL is written.
+
+2. **First engine model: `abr_sampler_top`.**  This is the one used by
+   essentially every operation (it wraps the SHA3/Keccak sampler).  It
+   is purely behavioural for our purposes — translate the upstream
+   functional spec (`fips204.py` is a usable reference) into C and
+   wire its inputs/outputs through `presi_bb.csv`.  Once
+   `abr_sampler_top` works the controller can start an MLDSA op even
+   if NTT/encode/decode are still stubs, which gives a real cycle
+   trace for the early stages of `mldsa-keygen`.
+
+3. **Remaining 13 engines.**  In order of "needed first" by
+   `mldsa-keygen` flow: `ntt_top`, `power2round_top`, `skencode`,
+   `decompose`, `makehint`, `norm_check_top`, `sigencode_z_top`,
+   `pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`,
+   `decompress_top`, `skdecode_top`.  All have pin lists in
+   `presi_bb.csv`.
+
+4. **SRAM port-width truncation.**  Re-test the post-hierarchy
+   `blackbox m:*abr_1r1w_ram*` flow with `opt -fast` (or `synth -fast`)
+   to see if it can finish under the 10-minute budget; that's the
+   smallest edit that fixes the netlist exposing only addr=6 / data=32
+   per SRAM.
+
+5. **AHB-read latency cleanup.**  `ahb_read()` currently holds the
+   address phase for two cycles to align with `abr_ahb_slv_sif`'s
+   registered-address pipeline.  This works but is an empirical fudge
+   on top of the 2-step `presi_cycle`.  Consider whether a single-step
+   `presi_cycle` plus a post-flop second `presi_step_netlist()` (so
+   combinational propagates the new flop values within the same cycle)
+   would let `ahb_read()` go back to the textbook 1-cycle address
+   phase and get rid of the lag.  Worth a few hours but not blocking.
+
+6. **Stage 5 — first end-to-end operation.**  Once items 1–3 are in,
+   run `mldsa-keygen` (or the smaller `mlkem-keygen`) through the
+   harness, compare `_out.dat` files byte-for-byte against the existing
+   `./abr_wrap` Verilator wrapper, record cycle count + runtime.
+
+7. **Stages 6–7.**  Trace hooks and leakage instrumentation, after
+   Stage 5 lands.

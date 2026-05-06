@@ -251,12 +251,15 @@ static void presi_drive_idle(struct presi_model *m)
 static void presi_cycle(struct presi_model *m)
 {
     /*
-     * One cycle = two netlist evaluations.  The first half holds clk=0
-     * to let combinational logic settle; the second half holds clk=1 and
-     * is the rising-edge step where the generated `_presi_delay_<n>`
-     * temporaries advance the flops.  SRAM tick happens once per cycle
-     * after the clk=1 step, modelling the synchronous one-cycle read
-     * latency of abr_1r1w_ram.
+     * Two-step cycle (clk=0 then clk=1).  Many of the generated
+     * combinational signals read their inputs *before* the flop update
+     * statements that drive them (Yosys's emit order is roughly
+     * "combinational, then flop updates"), so a single presi_step_netlist
+     * picks up only the previous cycle's flop values for *every* signal,
+     * producing all-zero AHB reads.  Two steps per cycle let the second
+     * step see the first step's flop updates, which is enough to push
+     * register reads through to hrdata_o (with a one-register pipeline
+     * lag for back-to-back AHB transactions; see ahb_read).
      */
     m->p.clk = PRESI_0;
     presi_apply_inputs(m);
@@ -311,37 +314,30 @@ static void ahb_write(struct presi_model *m, uint32_t addr, uint32_t data)
 static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
 {
     uint64_t data;
-    unsigned guard;
 
-    /* Address phase: drive haddr/htrans/hsel/hwrite=0 until the slave
-     * acknowledges by holding hreadyout_o high (it may insert wait
-     * states by holding it low). */
+    /* Address phase: drive haddr/htrans/hsel/hwrite=0 for one cycle.
+     * The slave latches addr+dv at the rising edge inside presi_cycle. */
     m->p.hsel_i = PRESI_1;
     m->p.hwrite_i = PRESI_0;
     out_word(m->p.htrans_i, 2, AHB_TRANS_NONSEQ);
     out_word(m->p.hsize_i, 3, 2u);
     out_word(m->p.haddr_i, 32, addr);
-    for (guard = 0; guard < 32; guard++) {
-        presi_cycle(m);
-        if (m->p.hreadyout_o & 1) {
-            break;
-        }
-    }
+    presi_cycle(m);
 
-    /* Data phase: hold IDLE on the bus.  The slave delivers hrdata one
-     * to a few cycles after the address phase; we sample at every cycle
-     * looking for hrdata transitioning away from zero (any non-zero
-     * read), with a guard so a true zero read still returns. */
+    /*
+     * Hold the address phase for a SECOND cycle.  The slave's
+     * combinational hrdata_o lags one cycle behind a fresh address
+     * (back-to-back transactions appear shifted by one register
+     * otherwise), so issuing the same address twice means the second
+     * data phase reflects this transaction's address rather than the
+     * previous transaction's. */
+    presi_cycle(m);
+
+    /* Data phase: drive IDLE, then sample after one cycle. */
     presi_drive_idle(m);
     out_dword(m->p.hwdata_i, 64, 0);
-    data = 0;
-    for (guard = 0; guard < 8; guard++) {
-        presi_cycle(m);
-        data = in_dword(m->p.hrdata_o, 64);
-        if (data != 0) {
-            break;
-        }
-    }
+    presi_cycle(m);
+    data = in_dword(m->p.hrdata_o, 64);
     return (uint32_t) ((addr & 4u) ? (data >> 32) : data);
 }
 
@@ -406,12 +402,22 @@ int main(int argc, char **argv)
     printf("[BUS]\tcycle=%llu post-reset hreadyout=%u busy=%u\n",
            (unsigned long long) model.cycle,
            model.p.hreadyout_o & 1, model.p.busy_o & 1);
-    printf("[BUS]\tNAME    =%08x  (expected 0x44534d4c \"MLSD\")\n",
-           ahb_read(&model, ABR_NAME));
-    printf("[BUS]\tVERSION =%08x\n",
-           ahb_read(&model, ABR_VERSION));
-    printf("[BUS]\tSTATUS  =%08x\n",
-           ahb_read(&model, ABR_STATUS));
+    /*
+     * Sanity-check the abr_reg name/version/status layout.  Constants
+     * come from abr_params_pkg.sv:
+     *   MLDSA_CORE_NAME    = 64'h3837412D_44534D4C  ("MLDSA-87")
+     *   MLDSA_CORE_VERSION = 64'h00003300_302E322E  ("2.0.3")
+     */
+    printf("[BUS]\tNAME[0]    =%08x  (want 44534d4c)\n",
+           ahb_read(&model, 0x00));
+    printf("[BUS]\tNAME[1]    =%08x  (want 3837412d)\n",
+           ahb_read(&model, 0x04));
+    printf("[BUS]\tVERSION[0] =%08x  (want 302e322e)\n",
+           ahb_read(&model, 0x08));
+    printf("[BUS]\tVERSION[1] =%08x  (want 00003300)\n",
+           ahb_read(&model, 0x0c));
+    printf("[BUS]\tSTATUS     =%08x  (READY bit expected = 1)\n",
+           ahb_read(&model, 0x14));
     ahb_write(&model, ABR_ENTROPY, 0);
     ahb_write(&model, ABR_CTRL, 0);
 
