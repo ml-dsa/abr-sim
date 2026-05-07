@@ -389,18 +389,26 @@ Priorities, in rough order:
        prefixed part .c produces an .o whose nm output has only
        prefixed externs (no `clk`, `reset_n`, etc. at file scope).
 
-   3b. **Per-engine `<engine>_step.c` glue.**  For each engine,
-       generate a small C file that:
-       - declares `extern presi_t <prefix>__<port_bit>` for every
-         engine-side port pin
-       - declares `extern presi_t <abr_wrap_bb_pin>` for the matching
-         abr_wrap-side pin
-       - exposes `<engine>_step(struct presi_model *m)`: copy
-         abr_wrap → engine inputs, call the engine's step function,
-         copy engine outputs → abr_wrap.
-       Pin pairings come from `presi_bb.csv` (abr_wrap side) and the
-       module's port list (engine side -- can read from the
-       `presi_var.h` of the per-engine flow).
+   3b. ~~**Per-engine `<engine>.glue.c` generator.**~~ Done 2026-05-07.
+       New `presi/flow/gen_engine_glue.py` reads:
+       - `abr_wrap.presi_bb.csv` (one row per blackbox cell pin)
+       - `<engine>.gates.v` (engine's port directions/widths)
+       and emits a `<engine>.glue.c` containing extern decls for both
+       sides plus `void <engine>_step_glue(void)` that:
+         - copies abr_wrap → engine inputs (pin_index N → port-bit N)
+         - calls `<prefix>presi_step_part_NNN()` for each part
+         - updates `<prefix>presi_clk_prev = <prefix>clk`
+         - copies engine outputs → abr_wrap
+       Skips writes to outputs whose abr_wrap-side pin is `PRESI_0` /
+       `PRESI_1` (Yosys constant-folded the unused fanout, e.g.
+       ntt_top's `ntt_done` is unused by abr_ctrl).
+       Auto-detects the abr_wrap bb instance when there's only one
+       per module.  Verified for ntt_top (1934 bits, 1484 in / 450 out
+       / 1 unused) and abr_sampler_top (2021 bits, 114 in / 1907 out /
+       0 unused — sampler_state_data_o alone is 1600 bits).
+       New `make engine-glue` target produces both .glue.c files in
+       seconds; pattern rules build .glue.o.  Each compiles to a
+       ~300 KB .o whose only T-symbol is `<engine>_step_glue`.
 
    3c. **`abr_seq` controller per-engine flow.**  Currently only the
        sequencer ROM contents are wired (`make seq-rom`); the FSM

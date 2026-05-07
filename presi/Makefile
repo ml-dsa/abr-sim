@@ -55,7 +55,7 @@ PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
 CSRC            := presi.c presi_sram.c
 
-.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top inventory run run-gates clean
+.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top engine-glue inventory run run-gates clean
 
 all: $(PRESI)
 
@@ -234,6 +234,42 @@ $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)
 		--map $(BUILD)/abr_sampler_top.presi_map.csv \
 		--bb $(BUILD)/abr_sampler_top.presi_bb.csv
 	@touch $@
+
+# Per-engine glue: links each engine's standalone gate netlist to its
+# blackbox pin connections in the unified abr_wrap netlist.  Glue C
+# files copy abr_wrap-side bb pin values onto the engine's input
+# externs, step the engine, then copy engine outputs back to the
+# abr_wrap-side externs.  Generated from:
+#   - abr_wrap.presi_bb.csv (pin list per blackbox cell instance)
+#   - <engine>.gates.v       (engine's port directions/widths)
+NTT_GLUE_C      := $(BUILD)/ntt_top.glue.c
+SAMPLER_GLUE_C  := $(BUILD)/abr_sampler_top.glue.c
+NTT_GLUE_O      := $(BUILD)/ntt_top.glue.o
+SAMPLER_GLUE_O  := $(BUILD)/abr_sampler_top.glue.o
+
+engine-glue: $(NTT_GLUE_C) $(SAMPLER_GLUE_C)
+
+$(NTT_GLUE_C): $(GATES_BB) $(BUILD)/ntt_top.gates.v $(FLOW)/gen_engine_glue.py
+	python3 $(FLOW)/gen_engine_glue.py --engine ntt_top \
+		--abr-wrap-bb $(GATES_BB) \
+		--engine-gates-v $(BUILD)/ntt_top.gates.v \
+		--engine-prefix 'ntt_top__' \
+		--engine-num-parts $(NTT_GATE_C_PARTS) \
+		--out $@
+
+$(SAMPLER_GLUE_C): $(GATES_BB) $(BUILD)/abr_sampler_top.gates.v $(FLOW)/gen_engine_glue.py
+	python3 $(FLOW)/gen_engine_glue.py --engine abr_sampler_top \
+		--abr-wrap-bb $(GATES_BB) \
+		--engine-gates-v $(BUILD)/abr_sampler_top.gates.v \
+		--engine-prefix 'abr_sampler_top__' \
+		--engine-num-parts $(SAMPLER_GATE_C_PARTS) \
+		--out $@
+
+$(NTT_GLUE_O): $(NTT_GLUE_C)
+	gcc $(CFLAGS_GATES) -c -o $@ $<
+
+$(SAMPLER_GLUE_O): $(SAMPLER_GLUE_C)
+	gcc $(CFLAGS_GATES) -c -o $@ $<
 
 inventory: $(INVENTORY)
 
