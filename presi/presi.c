@@ -111,6 +111,11 @@ static void presi_step_netlist(void)
 {
 #ifdef PRESI_HAVE_NETLIST
 #include "abr_wrap.presi_clk.h"
+    /* After each step, snapshot clk so the next step's rising-edge
+     * predicate (`clk & ~presi_clk_prev`) fires only on a real 0->1
+     * transition.  Without this, repeated calls with clk=1 would
+     * re-clock every flop and produce double-rate behavior. */
+    presi_clk_prev = clk;
 #endif
 }
 
@@ -188,6 +193,74 @@ static presi_t *const presi_hrdata_o_bits[64] = {
 #undef X
 };
 
+/*
+ * Internal-state probes.  These reach into the flattened netlist by
+ * extern reference -- the names come straight from
+ * presi_map.csv (the SPICE->C name table emitted by spice_to_c.py) and
+ * exist only as long as the abr_ctrl wires aren't optimised away.  Used
+ * by the FSM-trace block in main() so we can watch abr_prog_cntr walk
+ * the ROM after a MLDSA_CTRL write.
+ */
+#define _PRESI_PROG_CNTR_BITS \
+    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9)
+
+#define _PRESI_CMD_REG_BITS \
+    X(0) X(1) X(2)
+
+#define X(i) extern presi_t top0_abr_ctrl_inst_abr_prog_cntr_##i;
+_PRESI_PROG_CNTR_BITS
+#undef X
+#define X(i) extern presi_t top0_abr_ctrl_inst_abr_prog_cntr_nxt_##i;
+_PRESI_PROG_CNTR_BITS
+#undef X
+#define X(i) extern presi_t top0_abr_ctrl_inst_mldsa_cmd_reg_##i;
+_PRESI_CMD_REG_BITS
+#undef X
+#define X(i) extern presi_t top0_abr_ctrl_inst_mlkem_cmd_reg_##i;
+_PRESI_CMD_REG_BITS
+#undef X
+extern presi_t top0_abr_ctrl_inst_abr_seq_en;
+extern presi_t top0_abr_ctrl_inst_zeroize;
+/* `top0_abr_ctrl_inst_zeroize` is the wire opt-merged with
+ * stream_msg_buffer.zeroize -- it tracks the *output* of the OR that
+ * feeds the abr_ctrl zeroize signal.  field_storage_357/5095 are the
+ * two MLDSA_CTRL.ZEROIZE / MLKEM_CTRL.ZEROIZE field flops (numbers
+ * picked up from spice_to_c.py's name-mangling in part_000.c). */
+extern presi_t top0_abr_reg_inst_field_storage_357;
+extern presi_t top0_abr_reg_inst_field_storage_5095;
+
+static const presi_t *const presi_prog_cntr_bits[10] = {
+#define X(i) &top0_abr_ctrl_inst_abr_prog_cntr_##i,
+    _PRESI_PROG_CNTR_BITS
+#undef X
+};
+static const presi_t *const presi_prog_cntr_nxt_bits[10] = {
+#define X(i) &top0_abr_ctrl_inst_abr_prog_cntr_nxt_##i,
+    _PRESI_PROG_CNTR_BITS
+#undef X
+};
+static const presi_t *const presi_mldsa_cmd_reg_bits[3] = {
+#define X(i) &top0_abr_ctrl_inst_mldsa_cmd_reg_##i,
+    _PRESI_CMD_REG_BITS
+#undef X
+};
+static const presi_t *const presi_mlkem_cmd_reg_bits[3] = {
+#define X(i) &top0_abr_ctrl_inst_mlkem_cmd_reg_##i,
+    _PRESI_CMD_REG_BITS
+#undef X
+};
+
+static unsigned presi_read_bits(const presi_t *const *bits, int n)
+{
+    unsigned v = 0;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        v |= (unsigned) (*bits[i] & 1) << i;
+    }
+    return v;
+}
+
 #endif /* PRESI_HAVE_NETLIST */
 
 
@@ -258,15 +331,17 @@ static void presi_drive_idle(struct presi_model *m)
 static void presi_cycle(struct presi_model *m)
 {
     /*
-     * Two-step cycle (clk=0 then clk=1).  Many of the generated
-     * combinational signals read their inputs *before* the flop update
-     * statements that drive them (Yosys's emit order is roughly
-     * "combinational, then flop updates"), so a single presi_step_netlist
-     * picks up only the previous cycle's flop values for *every* signal,
-     * producing all-zero AHB reads.  Two steps per cycle let the second
-     * step see the first step's flop updates, which is enough to push
-     * register reads through to hrdata_o (with a one-register pipeline
-     * lag for back-to-back AHB transactions; see ahb_read).
+     * One logical clock cycle.  spice_to_c.py emits each DFF with the
+     * rising-edge predicate `(clk & ~presi_clk_prev)`, so flops only
+     * tick on a 0->1 clock transition; subsequent step_netlist calls
+     * settle combinational without re-clocking.
+     *
+     * We call step_netlist multiple times per phase to fully settle
+     * the gate-level network: each call propagates roughly one "level"
+     * of logic per part file, and the part files run in fixed order
+     * across 32 TUs, so reading a signal before the cell driving it is
+     * evaluated returns a stale value.  Three passes per phase
+     * empirically settles abr_wrap.
      */
     m->p.clk = PRESI_0;
     presi_apply_inputs(m);
@@ -307,15 +382,32 @@ static void ahb_write(struct presi_model *m, uint32_t addr, uint32_t data)
 {
     uint64_t lane_data;
 
+    /* Mirror ahb_read's 2-cycle address phase + 1-cycle data phase
+     * arrangement.  abr_ahb_slv_sif's registered-address pipeline means
+     * the slave's combinational hrdata (and write-strobe) lag the
+     * incoming address by one cycle, so back-to-back transactions on
+     * tight-1-cycle phases end up either reading from the *previous*
+     * address or writing zeros.  Holding address+control for 2 cycles
+     * and presenting hwdata in the third settles the slave on this
+     * transaction's data. */
     lane_data = (addr & 4u) ? ((uint64_t) data << 32) : (uint64_t) data;
+
+    /* T1+T2: address phase held for two cycles, hwrite=1. */
     m->p.hsel_i = PRESI_1;
     m->p.hwrite_i = PRESI_1;
     out_word(m->p.htrans_i, 2, AHB_TRANS_NONSEQ);
     out_word(m->p.hsize_i, 3, 2u);
     out_word(m->p.haddr_i, 32, addr);
+    out_dword(m->p.hwdata_i, 64, 0);
+    presi_cycle(m);
+    presi_cycle(m);
+
+    /* T3: data phase.  Drive the payload on hwdata, address goes IDLE. */
+    presi_drive_idle(m);
     out_dword(m->p.hwdata_i, 64, lane_data);
     presi_cycle(m);
-    ahb_clear(m);
+
+    out_dword(m->p.hwdata_i, 64, 0);
 }
 
 static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
@@ -428,28 +520,80 @@ int main(int argc, char **argv)
     ahb_write(&model, ABR_ENTROPY, 0);
 
     /*
-     * Smoke test: kick off MLDSA keygen and observe the controller for
-     * a few hundred cycles.  With only the abr_seq ROM wired (engines
-     * still stubbed out), the FSM should leave the IDLE/RESET program
-     * counter and start dispatching UOPs -- but the operation will
-     * stall once it asks the (stub) sampler/SHA3 to do work.  What we
-     * want to confirm here is that the controller actually reads UOPs
-     * out of the ROM, i.e. the seq ROM is plumbed correctly.
+     * Smoke test: kick off MLDSA keygen and watch the controller walk
+     * the abr_seq ROM for a few hundred cycles.  With only the ROM
+     * wired (engines still stubbed out), the FSM should leave
+     * ABR_RESET, advance MLDSA_KG_S, MLDSA_KG_S+1, ..., and stall once
+     * it asks the (stub) sampler/SHA3 to acknowledge a UOP.  What we
+     * want to confirm here is that abr_prog_cntr actually moves --
+     * proves the ROM dispatch is correctly plumbed.
+     *
+     * Trace strategy: read abr_prog_cntr each cycle and print only on
+     * change, so a single multi-cycle stall doesn't drown the log.
      */
     {
         unsigned poll;
         unsigned n_busy = 0;
         unsigned cycle_at_busy = 0;
+        unsigned prev_pc = (unsigned) -1;
+        unsigned same_count = 0;
         printf("[CTRL]\twriting MLDSA_CTRL = 1 (keygen)\n");
         ahb_write(&model, ABR_CTRL, 1);
         for (poll = 0; poll < 256; poll++) {
             presi_cycle(&model);
+#ifdef PRESI_HAVE_NETLIST
+            {
+                unsigned pc = presi_read_bits(presi_prog_cntr_bits, 10);
+                unsigned pc_nxt = presi_read_bits(presi_prog_cntr_nxt_bits, 10);
+                unsigned en = top0_abr_ctrl_inst_abr_seq_en & 1;
+                unsigned mldsa_cmd = presi_read_bits(presi_mldsa_cmd_reg_bits, 3);
+                unsigned mlkem_cmd = presi_read_bits(presi_mlkem_cmd_reg_bits, 3);
+                static unsigned prev_cmd = (unsigned) -1;
+                unsigned cmd_pair = (mlkem_cmd << 4) | mldsa_cmd;
+                unsigned zeroize = top0_abr_ctrl_inst_zeroize & 1;
+                unsigned z357 = top0_abr_reg_inst_field_storage_357 & 1;
+                unsigned z5095 = top0_abr_reg_inst_field_storage_5095 & 1;
+                static unsigned prev_zeroize = (unsigned) -1;
+                static unsigned prev_zfields = (unsigned) -1;
+                unsigned zfields = (z5095 << 1) | z357;
+                if (cmd_pair != prev_cmd) {
+                    printf("[REG]\tcycle=%-3u  mldsa_cmd=%u  mlkem_cmd=%u\n",
+                           poll, mldsa_cmd, mlkem_cmd);
+                    prev_cmd = cmd_pair;
+                }
+                if (zeroize != prev_zeroize) {
+                    printf("[REG]\tcycle=%-3u  zeroize=%u\n", poll, zeroize);
+                    prev_zeroize = zeroize;
+                }
+                if (zfields != prev_zfields) {
+                    printf("[REG]\tcycle=%-3u  field_357=%u "
+                           "field_5095=%u\n", poll, z357, z5095);
+                    prev_zfields = zfields;
+                }
+                if (pc != prev_pc) {
+                    if (same_count > 0) {
+                        printf("[FSM]\t  ... held for %u cycle%s\n",
+                               same_count, same_count == 1 ? "" : "s");
+                    }
+                    printf("[FSM]\tcycle=%-3u  pc=%-4u  nxt=%-4u  en=%u\n",
+                           poll, pc, pc_nxt, en);
+                    prev_pc = pc;
+                    same_count = 0;
+                } else {
+                    same_count++;
+                }
+            }
+#endif
             if (model.p.busy_o & 1) {
                 if (n_busy == 0) {
                     cycle_at_busy = poll;
                 }
                 n_busy++;
             }
+        }
+        if (same_count > 0) {
+            printf("[FSM]\t  ... held for %u cycle%s\n",
+                   same_count, same_count == 1 ? "" : "s");
         }
         printf("[CTRL]\tafter %u cycles: first-busy=%u busy-cycles=%u "
                "final-busy=%u status=%08x\n",
