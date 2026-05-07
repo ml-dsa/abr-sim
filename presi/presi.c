@@ -223,11 +223,26 @@ extern presi_t top0_abr_ctrl_inst_abr_seq_en;
 extern presi_t top0_abr_ctrl_inst_zeroize;
 /* `top0_abr_ctrl_inst_zeroize` is the wire opt-merged with
  * stream_msg_buffer.zeroize -- it tracks the *output* of the OR that
- * feeds the abr_ctrl zeroize signal.  field_storage_357/5095 are the
- * two MLDSA_CTRL.ZEROIZE / MLKEM_CTRL.ZEROIZE field flops (numbers
- * picked up from spice_to_c.py's name-mangling in part_000.c). */
+ * feeds the abr_ctrl zeroize signal.  Per spice_to_c output:
+ *   stream_msg_buffer_zeroize = field_storage_357 | field_storage_5095
+ * which are the two ZEROIZE field flops (MLDSA / MLKEM). */
+extern presi_t top0_abr_ctrl_inst_stream_msg_buffer_zeroize;
 extern presi_t top0_abr_reg_inst_field_storage_357;
 extern presi_t top0_abr_reg_inst_field_storage_5095;
+/* D inputs to the prog_cntr DFFs.  pc[0] D is forced to 1 when
+ * stream_msg_buffer_zeroize is high (drives ZEROIZE state); else
+ * pc[i] D is whatever the case-logic mux n_80420 produced. */
+extern presi_t n_16132_0;
+extern presi_t n_16132_1;
+extern presi_t n_80420_0;
+extern presi_t n_80420_1;
+/* Higher-level state */
+extern presi_t top0_abr_ctrl_inst_abr_ready;
+extern presi_t top0_abr_ctrl_inst_abr_idle;
+extern presi_t top0_abr_ctrl_inst_error_flag_reg;
+extern presi_t top0_abr_ctrl_inst_subcomponent_busy;
+extern presi_t top0_abr_ctrl_inst_clear_verify_valid;
+extern presi_t top0_abr_ctrl_inst_mldsa_keygen_process;
 
 static const presi_t *const presi_prog_cntr_bits[10] = {
 #define X(i) &top0_abr_ctrl_inst_abr_prog_cntr_##i,
@@ -548,41 +563,42 @@ int main(int argc, char **argv)
                 unsigned en = top0_abr_ctrl_inst_abr_seq_en & 1;
                 unsigned mldsa_cmd = presi_read_bits(presi_mldsa_cmd_reg_bits, 3);
                 unsigned mlkem_cmd = presi_read_bits(presi_mlkem_cmd_reg_bits, 3);
-                static unsigned prev_cmd = (unsigned) -1;
-                unsigned cmd_pair = (mlkem_cmd << 4) | mldsa_cmd;
-                unsigned zeroize = top0_abr_ctrl_inst_zeroize & 1;
+                unsigned z = top0_abr_ctrl_inst_stream_msg_buffer_zeroize & 1;
                 unsigned z357 = top0_abr_reg_inst_field_storage_357 & 1;
                 unsigned z5095 = top0_abr_reg_inst_field_storage_5095 & 1;
-                static unsigned prev_zeroize = (unsigned) -1;
-                static unsigned prev_zfields = (unsigned) -1;
-                unsigned zfields = (z5095 << 1) | z357;
-                if (cmd_pair != prev_cmd) {
-                    printf("[REG]\tcycle=%-3u  mldsa_cmd=%u  mlkem_cmd=%u\n",
-                           poll, mldsa_cmd, mlkem_cmd);
-                    prev_cmd = cmd_pair;
-                }
-                if (zeroize != prev_zeroize) {
-                    printf("[REG]\tcycle=%-3u  zeroize=%u\n", poll, zeroize);
-                    prev_zeroize = zeroize;
-                }
-                if (zfields != prev_zfields) {
-                    printf("[REG]\tcycle=%-3u  field_357=%u "
-                           "field_5095=%u\n", poll, z357, z5095);
-                    prev_zfields = zfields;
-                }
-                if (pc != prev_pc) {
+                unsigned d0 = n_16132_0 & 1;
+                unsigned d1 = n_16132_1 & 1;
+                unsigned m0 = n_80420_0 & 1;
+                unsigned m1 = n_80420_1 & 1;
+                /* Dump every cycle so we can see when zeroize pulses
+                 * and which signal flips it.  No dedup here -- the
+                 * goal is to catch the bouncing pattern. */
+                unsigned rdy = top0_abr_ctrl_inst_abr_ready & 1;
+                unsigned idle = top0_abr_ctrl_inst_abr_idle & 1;
+                unsigned err = top0_abr_ctrl_inst_error_flag_reg & 1;
+                unsigned sub = top0_abr_ctrl_inst_subcomponent_busy & 1;
+                unsigned cvv = top0_abr_ctrl_inst_clear_verify_valid & 1;
+                unsigned kgp = top0_abr_ctrl_inst_mldsa_keygen_process & 1;
+                if (poll < 16) {
+                    printf("[FSM]\tc=%u pc=%u nxt=%u en=%u  "
+                           "rdy=%u idle=%u err=%u sub=%u cvv=%u kgp=%u  "
+                           "z=%u d=%u%u mux=%u%u cmd=%u/%u\n",
+                           poll, pc, pc_nxt, en, rdy, idle, err, sub, cvv,
+                           kgp, z, d1, d0, m1, m0, mldsa_cmd, mlkem_cmd);
+                } else if (pc != prev_pc) {
                     if (same_count > 0) {
                         printf("[FSM]\t  ... held for %u cycle%s\n",
                                same_count, same_count == 1 ? "" : "s");
                     }
-                    printf("[FSM]\tcycle=%-3u  pc=%-4u  nxt=%-4u  en=%u\n",
-                           poll, pc, pc_nxt, en);
+                    printf("[FSM]\tcycle=%u  pc=%u  nxt=%u  en=%u  z=%u\n",
+                           poll, pc, pc_nxt, en, z);
                     prev_pc = pc;
                     same_count = 0;
                 } else {
                     same_count++;
                 }
             }
+            (void) prev_pc;
 #endif
             if (model.p.busy_o & 1) {
                 if (n_busy == 0) {
