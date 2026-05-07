@@ -29,6 +29,22 @@ import re
 
 SRAM_MODULES = ("abr_1r1w_ram", "abr_1r1w_be_ram")
 
+# abr_seq is blackboxed at the SV-module boundary in the gates flow (so
+# `proc` doesn't burn 10+ minutes elaborating its 1024-way unique case).
+# bb.csv records its 99 pins (clk, en_i, addr_i[10], data_o[87]) in SV
+# port order, and we drive data_o each cycle from the ROM table emitted
+# by extract_seq_rom.py.
+SEQ_MODULE = "abr_seq"
+
+# Logical abr_seq port suffixes -- these match the port declarations in
+# adams-bridge/src/abr_top/rtl/abr_seq.sv.
+SEQ_PORT_SUFFIXES = (
+    "clk",
+    "en_i",
+    "addr_i",
+    "data_o",
+)
+
 # Logical SRAM ports recognised by suffix.  Order matches the SystemVerilog
 # module declaration in adams-bridge/src/abr_libs/rtl/abr_1r1w*ram.sv.
 SRAM_PORT_SUFFIXES = (
@@ -44,6 +60,7 @@ SRAM_PORT_SUFFIXES = (
 SRAM_PORT_RE = {
     name: re.compile(r"(?:.*[_.])?" + name + r"$") for name in SRAM_PORT_SUFFIXES
 }
+
 
 
 def c_ident(name):
@@ -251,20 +268,96 @@ def emit_sram_block(f, inst_xname, sram_idx, sram, ports):
     f.write("\t}\n")
 
 
-def emit(out_path, instances, srams):
+def split_seq_pins_positional(pins, abits, full_width):
+    """abr_seq is blackboxed at the SV-module boundary, so write_spice
+    emits its pins in SV declaration order: clk, en_i, addr_i[ABITS],
+    data_o[FULL_WIDTH].  Walk the pin list positionally."""
+    ports = {}
+    expect = [
+        ("clk", 1),
+        ("en_i", 1),
+        ("addr_i", abits),
+        ("data_o", full_width),
+    ]
+    idx = 0
+    for name, count in expect:
+        chunk = []
+        for _ in range(count):
+            if idx >= len(pins):
+                break
+            chunk.append(pins[idx][1])  # c_name
+            idx += 1
+        if chunk:
+            ports[name] = chunk
+    return ports
+
+
+def emit_seq_block(f, inst_xname, ports, full_width):
+    """Emit the cycle body for the abr_seq blackbox.
+
+    abr_seq's behavior (rtl/abr_seq.sv):
+      always_ff @(posedge clk) begin
+          if (en_i) data_o_rom <= ROM[addr_i];
+          else      data_o_rom <= '{ABR_UOP_NOP, ...};   // all zeros
+      end
+      assign data_o = data_o_rom;
+
+    presi_sram_tick_all() runs after the rising edge, so we model the
+    flop by reading the *current* en_i/addr_i and updating data_o here.
+    The combinational `assign data_o = data_o_rom` is implicit -- we
+    drive data_o pins directly with the ROM word.
+
+    presi_abr_seq_rom[] holds the full SV-width (87-bit) values
+    reassembled from the proc_rom-stripped INIT data plus the bit-map
+    in abr_wrap.seq_rom.json."""
+    addr_pins = ports.get("addr_i", [])
+    data_pins = ports.get("data_o", [])
+    en_pins = ports.get("en_i", [])
+
+    f.write("\t/* abr_seq blackbox (%s)\n"
+            "\t * netlist exposes addr=%u data=%u (full width %u);\n"
+            "\t * driven from presi_abr_seq_rom[] in abr_wrap.seq_rom.h. */\n" %
+            (inst_xname, len(addr_pins), len(data_pins), full_width))
+    f.write("\t{\n")
+    if en_pins:
+        f.write("\t\tunsigned _en = %s & 1;\n" % en_pins[0])
+    else:
+        f.write("\t\tunsigned _en = 0u;  /* no en_i pin */\n")
+    f.write("\t\tuint32_t _addr = 0u")
+    for i, n in enumerate(addr_pins):
+        f.write(" | ((uint32_t)(%s & 1) << %d)" % (n, i))
+    f.write(";\n")
+    f.write("\t\t_addr &= (PRESI_ABR_SEQ_ROM_SIZE - 1u);\n")
+    for i, n in enumerate(data_pins):
+        word = i // 32
+        bit = i % 32
+        f.write("\t\t%s = (_en && ((presi_abr_seq_rom[_addr][%d] >> %d) "
+                "& 1u)) ? PRESI_1 : PRESI_0;\n" % (n, word, bit))
+    f.write("\t}\n")
+
+
+def emit(out_path, instances, srams, seq_meta):
     sram_blocks = []
+    seq_blocks = []
     other = []
+    seq_full_width = seq_meta["full_width"] if seq_meta is not None else 87
+    seq_abits = seq_meta["abits"] if seq_meta is not None else 10
     for inst, module, pins in instances:
-        if module not in SRAM_MODULES:
-            other.append((inst, module))
+        if module in SRAM_MODULES:
+            ports = group_pins(pins)
+            we_pins = [(s, c) for s, c in pins
+                       if classify_port(split_port(s)[0]) == "we_i"]
+            if not we_pins:
+                raise SystemExit("%s: no we_i pin found" % inst)
+            we_base = split_port(we_pins[0][0])[0]
+            idx, sram = lookup_sram_index(srams, we_base)
+            sram_blocks.append((inst, idx, sram, ports))
             continue
-        ports = group_pins(pins)
-        we_pins = [(s, c) for s, c in pins if classify_port(split_port(s)[0]) == "we_i"]
-        if not we_pins:
-            raise SystemExit("%s: no we_i pin found" % inst)
-        we_base = split_port(we_pins[0][0])[0]
-        idx, sram = lookup_sram_index(srams, we_base)
-        sram_blocks.append((inst, idx, sram, ports))
+        if module == SEQ_MODULE:
+            ports = split_seq_pins_positional(pins, seq_abits, seq_full_width)
+            seq_blocks.append((inst, ports))
+            continue
+        other.append((inst, module))
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("/* Generated by gen_blackbox_wiring.py.  Do not edit.\n"
@@ -272,29 +365,44 @@ def emit(out_path, instances, srams):
                 " * Body of presi_sram_tick_all().  Each block samples one\n"
                 " * SRAM blackbox instance's input pins from the netlist,\n"
                 " * calls the matching presi_sram_* helper, and writes the\n"
-                " * resulting rdata_o back over the netlist bits. */\n")
+                " * resulting rdata_o back over the netlist bits.  The\n"
+                " * abr_seq $mem_v2 ROM gets its own block at the end. */\n")
         for inst, idx, sram, ports in sorted(sram_blocks, key=lambda b: b[1]):
             emit_sram_block(f, inst, idx, sram, ports)
+        for inst, ports in seq_blocks:
+            emit_seq_block(f, inst, ports, seq_full_width)
         if other:
-            f.write("\n\t/* Unwired blackboxes (engine, ROM, sequencer ROM):\n")
+            f.write("\n\t/* Unwired blackboxes (engines awaiting models):\n")
             for inst, module in other:
                 f.write("\t *   %-12s  %s\n" % (inst, module))
             f.write("\t */\n")
-    return len(sram_blocks), len(other)
+    return len(sram_blocks), len(seq_blocks), len(other)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bb", required=True)
     ap.add_argument("--sram-json", required=True)
+    ap.add_argument("--seq-rom-json", default=None,
+                    help="optional: extract_seq_rom.py JSON for "
+                         "positional pin fallback")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     instances = parse_bb(args.bb)
     srams = parse_sram_json(args.sram_json)
-    sram_count, other_count = emit(args.out, instances, srams)
-    print("blackbox-wiring: %d SRAMs wired, %d engine/ROM blackboxes still TODO"
-          % (sram_count, other_count))
+    seq_meta = None
+    if args.seq_rom_json:
+        try:
+            with open(args.seq_rom_json, encoding="utf-8") as f:
+                seq_meta = json.load(f)
+        except FileNotFoundError:
+            seq_meta = None
+    sram_count, seq_count, other_count = emit(
+        args.out, instances, srams, seq_meta)
+    print("blackbox-wiring: %d SRAMs wired, %d seq ROM(s) wired, "
+          "%d engine blackboxes still TODO" %
+          (sram_count, seq_count, other_count))
 
 
 if __name__ == "__main__":

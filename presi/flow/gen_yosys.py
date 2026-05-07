@@ -9,14 +9,17 @@ SRAM_MODULES = [
 ]
 
 # Modules blackboxed only in `gates` mode.  Keeping these as RTL would push the
-# gate netlist past available memory during ABC.  The presi C harness models
-# them behaviorally; per-engine gate-level builds (for leakage analysis of one
-# engine at a time) are a separate target.
+# gate netlist past available memory during ABC, or stall `proc` for tens of
+# minutes (abr_seq's 1024-way unique case statement).  The presi C harness
+# models them behaviorally; per-engine gate-level builds (for leakage analysis
+# of one engine at a time) are a separate target.
 #
-# The list mirrors abr_top's submodule instantiations: every engine instantiated
-# directly by abr_top is here, plus ntt_twiddle_lookup (a 4 x 85-entry ROM
-# expanded inside ntt_top).  What stays gate-mapped: abr_ctrl, abr_seq, abr_reg,
-# abr_prim_lfsr, and the abr_top dispatcher logic itself.
+# What stays gate-mapped: abr_ctrl, abr_reg, abr_prim_lfsr, and the abr_top
+# dispatcher logic itself.  `abr_seq` is blackboxed because `proc` choked on
+# its giant case statement; ROM contents come from a quick standalone Yosys
+# run on abr_seq alone (extract_seq_rom.py reads its $mem_v2 INIT param) and
+# the gates flow drives the abr_seq blackbox's 87-bit data_o port from the
+# extracted table.
 ENGINE_MODULES = [
     "ntt_twiddle_lookup",
     "abr_sampler_top",
@@ -33,6 +36,7 @@ ENGINE_MODULES = [
     "sigdecode_h",
     "compress_top",
     "decompress_top",
+    "abr_seq",
 ]
 
 
@@ -43,7 +47,11 @@ def emit_common(f, args):
     if args.mode in ("blackbox-sram", "gates"):
         for mod in SRAM_MODULES:
             f.write("blackbox %s\n" % mod)
-    if args.mode == "gates":
+        # Engines + abr_seq are also blackboxed in blackbox-sram mode so
+        # `proc` doesn't burn 10+ minutes elaborating their giant case
+        # statements; we don't need them for SRAM metadata anyway.  In
+        # gates mode the same set is required to keep the gate count and
+        # `proc` runtime in budget.
         for mod in ENGINE_MODULES:
             f.write("blackbox %s\n" % mod)
     # KNOWN WIDTH-TRUNCATION ISSUE: the blackbox above happens before
@@ -57,11 +65,16 @@ def emit_common(f, args):
     # the 10-minute build budget.  Documented as a follow-up in plan.md.
     f.write("hierarchy -check -top %s\n" % args.top)
     f.write("proc\n")
-    # opt (not opt_clean) folds parameter expressions like $clog2(Q)+1 that
-    # sv2v leaves as runtime arithmetic.  Without this, the gates flow
-    # techmaps thousands of $mul/$shift/$neg cells that should have been
-    # constants, blowing past available RAM during ABC.
-    f.write("opt\n")
+    if args.mode == "gates":
+        # opt (full, not -fast or opt_clean) folds parameter expressions like
+        # $clog2(Q)+1 that sv2v leaves as runtime arithmetic.  Without this,
+        # the gates flow techmaps thousands of $mul/$shift/$neg cells that
+        # should have been constants, blowing past available RAM during ABC.
+        f.write("opt\n")
+    # blackbox-sram and coarse modes skip the full `opt` -- it can take 15+
+    # minutes on the inlined abr_wrap and isn't needed when there's no
+    # techmap.  extract_sram_meta.py and extract_seq_rom.py both work off
+    # the post-`proc; memory -nomap; opt_clean` netlist.
 
 
 def emit_finish(f, args):

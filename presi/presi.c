@@ -16,6 +16,13 @@
  * live in abr_wrap.presi_var.c, compiled into a separate translation unit.
  */
 #include "abr_wrap.presi_var.h"
+/*
+ * abr_seq sequencer ROM contents extracted from the Yosys gates JSON.
+ * Defines `presi_abr_seq_rom[1024][N]`, `PRESI_ABR_SEQ_ROM_SIZE`,
+ * `PRESI_ABR_SEQ_ROM_WIDTH`, `PRESI_ABR_SEQ_ROM_WORDS`.  The bb-wiring
+ * block in presi_sram_tick_all() drives RD_DATA bits from this table.
+ */
+#include "abr_wrap.seq_rom.h"
 #else
 typedef uint8_t presi_t;
 #define PRESI_0 ((presi_t) 0)
@@ -419,12 +426,41 @@ int main(int argc, char **argv)
     printf("[BUS]\tSTATUS     =%08x  (READY bit expected = 1)\n",
            ahb_read(&model, 0x14));
     ahb_write(&model, ABR_ENTROPY, 0);
-    ahb_write(&model, ABR_CTRL, 0);
+
+    /*
+     * Smoke test: kick off MLDSA keygen and observe the controller for
+     * a few hundred cycles.  With only the abr_seq ROM wired (engines
+     * still stubbed out), the FSM should leave the IDLE/RESET program
+     * counter and start dispatching UOPs -- but the operation will
+     * stall once it asks the (stub) sampler/SHA3 to do work.  What we
+     * want to confirm here is that the controller actually reads UOPs
+     * out of the ROM, i.e. the seq ROM is plumbed correctly.
+     */
+    {
+        unsigned poll;
+        unsigned n_busy = 0;
+        unsigned cycle_at_busy = 0;
+        printf("[CTRL]\twriting MLDSA_CTRL = 1 (keygen)\n");
+        ahb_write(&model, ABR_CTRL, 1);
+        for (poll = 0; poll < 256; poll++) {
+            presi_cycle(&model);
+            if (model.p.busy_o & 1) {
+                if (n_busy == 0) {
+                    cycle_at_busy = poll;
+                }
+                n_busy++;
+            }
+        }
+        printf("[CTRL]\tafter %u cycles: first-busy=%u busy-cycles=%u "
+               "final-busy=%u status=%08x\n",
+               poll, cycle_at_busy, n_busy, model.p.busy_o & 1,
+               ahb_read(&model, ABR_STATUS));
+    }
 
 #ifndef PRESI_HAVE_NETLIST
     printf("[INFO]\tgenerated netlist C is not wired yet\n");
 #else
-    printf("[INFO]\tgenerated netlist C compiled; port binding is next\n");
+    printf("[INFO]\tabr_seq ROM wired; engines still TODO\n");
 #endif
 
     presi_free(&model);

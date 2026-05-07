@@ -1,7 +1,7 @@
 # Adams Bridge presilicon netlist simulator prototype.
 
 TOP             ?= abr_wrap
-GATE_TIMEOUT    ?= 600s
+GATE_TIMEOUT    ?= 1800s
 ROOT            := ..
 BUILD           := _build
 FLOW            := flow
@@ -23,6 +23,11 @@ BLACKBOX_STAT   := $(BUILD)/$(TOP).blackbox.stat.rpt
 GATES_STAT      := $(BUILD)/$(TOP).gates.stat.rpt
 SRAM_JSON       := $(BUILD)/$(TOP).sram.json
 SRAM_H          := $(BUILD)/$(TOP).sram.h
+SEQ_ROM_H       := $(BUILD)/$(TOP).seq_rom.h
+SEQ_ROM_JSON    := $(BUILD)/$(TOP).seq_rom.json
+ABR_SEQ_V       := $(BUILD)/abr_seq.standalone.v
+ABR_SEQ_YS      := $(BUILD)/abr_seq.standalone.ys
+ABR_SEQ_JSON    := $(BUILD)/abr_seq.standalone.json
 INVENTORY       := $(BUILD)/$(TOP).inventory.txt
 GATES_VAR_H     := $(BUILD)/$(TOP).presi_var.h
 GATES_VAR_C     := $(BUILD)/$(TOP).presi_var.c
@@ -43,7 +48,7 @@ PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
 CSRC            := presi.c presi_sram.c
 
-.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta inventory run run-gates clean
+.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom inventory run run-gates clean
 
 all: $(PRESI)
 
@@ -106,16 +111,46 @@ $(GATES_VAR_H) $(GATES_VAR_C) $(GATES_CLK_H) $(GATES_MAP) $(GATES_BB) $(GATES_PA
 	@:
 
 # Blackbox wiring header: turns presi_bb.csv pin lists into the body of
-# presi_sram_tick_all(), one block per SRAM instance.
-$(GATES_BB_WIRING): $(GATES_BB) $(SRAM_JSON) $(FLOW)/gen_blackbox_wiring.py
+# presi_sram_tick_all(), one block per SRAM instance plus an abr_seq
+# $mem_v2 ROM block.
+$(GATES_BB_WIRING): $(GATES_BB) $(SRAM_JSON) $(SEQ_ROM_JSON) \
+                    $(FLOW)/gen_blackbox_wiring.py
 	python3 $(FLOW)/gen_blackbox_wiring.py --bb $(GATES_BB) \
-		--sram-json $(SRAM_JSON) --out $@
+		--sram-json $(SRAM_JSON) --seq-rom-json $(SEQ_ROM_JSON) --out $@
 
 sram-meta: $(SRAM_JSON) $(SRAM_H)
 
 $(SRAM_JSON) $(SRAM_H): $(BLACKBOX_NETLIST) $(FLOW)/extract_sram_meta.py
 	python3 $(FLOW)/extract_sram_meta.py --netlist $(BLACKBOX_NETLIST) \
 		--json $(SRAM_JSON) --header $(SRAM_H)
+
+# Extract the abr_seq sequencer ROM from a *standalone* Yosys build of
+# just the abr_seq module.  The gates flow blackboxes abr_seq, so the
+# gates JSON does not contain a $mem_v2 cell for the sequencer ROM --
+# we run Yosys on abr_seq alone (slice extracted from sv2v.v) and feed
+# the resulting JSON to extract_seq_rom.py.  This finishes in seconds
+# instead of the 10+ minutes `proc` takes on the giant unique case
+# inside abr_seq when elaborated as part of the full design.
+seq-rom: $(SEQ_ROM_H) $(SEQ_ROM_JSON)
+
+$(ABR_SEQ_V): $(SV2V) $(FLOW)/extract_abr_seq.py | $(BUILD)
+	python3 $(FLOW)/extract_abr_seq.py --in $(SV2V) --top abr_seq --out $@
+
+$(ABR_SEQ_YS): $(ABR_SEQ_V) | $(BUILD)
+	@printf '%s\n' \
+		'read_verilog $(ABR_SEQ_V)' \
+		'hierarchy -check -top abr_seq' \
+		'proc' \
+		'memory -nomap' \
+		'opt_clean' \
+		'write_json $(ABR_SEQ_JSON)' > $@
+
+$(ABR_SEQ_JSON): $(ABR_SEQ_YS)
+	yosys -q $(ABR_SEQ_YS) 2>&1 | tee $(BUILD)/abr_seq.standalone.yosys.log
+
+$(SEQ_ROM_H) $(SEQ_ROM_JSON): $(ABR_SEQ_JSON) $(FLOW)/extract_seq_rom.py
+	python3 $(FLOW)/extract_seq_rom.py --standalone-json $(ABR_SEQ_JSON) \
+		--header $(SEQ_ROM_H) --json $(SEQ_ROM_JSON)
 
 inventory: $(INVENTORY)
 
@@ -135,8 +170,9 @@ $(BUILD)/$(TOP).presi_clk_part_%.o: $(BUILD)/$(TOP).presi_clk_part_%.c $(GATES_V
 $(GATES_VAR_O): $(GATES_VAR_C) $(GATES_VAR_H)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
-$(PRESI_GATES): $(CSRC) presi_sram.h $(SRAM_H) $(GATES_VAR_H) $(GATES_CLK_H) \
-                $(GATES_BB_WIRING) $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
+$(PRESI_GATES): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) $(GATES_VAR_H) \
+                $(GATES_CLK_H) $(GATES_BB_WIRING) $(GATES_VAR_O) \
+                $(GATES_PART_O) | $(BUILD)
 	gcc $(CFLAGS_GATES) -o $@ $(CSRC) $(GATES_VAR_O) $(GATES_PART_O)
 
 run: $(PRESI)
