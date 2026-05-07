@@ -364,13 +364,67 @@ Priorities, in rough order:
    **Still needed:** per-engine C harness for cycle-driving + toggle
    capture (same shape as the ntt_top harness item above).
 
-3. **Drive the harness through a real mldsa-keygen UOP stream.**
-   With the per-coeff engines already gate-mapped, once `abr_sampler_top`
-   has *any* working glue (even a stub returning known-good data into
-   the SRAM), the FSM should walk past MLDSA_KG_S into the per-coeff
-   block and exercise the gate-mapped engines for real.  Useful for
-   shaking out timing bugs in the AHB/abr_ctrl/engine handshake before
-   investing in the SHA3 model.
+3. **End-to-end Dilithium keygen via co-simulated per-engine
+   netlists.**  The unified abr_wrap flow stops fitting the budget
+   above ~5 M cells, so the heavy engines (`abr_sampler_top`,
+   `ntt_top`, plus an `abr_seq` core to be added) stay blackboxed
+   *in* abr_wrap but get co-simulated against their own gate
+   netlists.  Each cycle, the harness reads bb pin values from
+   abr_wrap, writes them onto the engine's standalone netlist input
+   ports, steps the engine one cycle, and writes the engine's outputs
+   back onto abr_wrap's bb pins.  Toggle activity comes out of all
+   netlists -- nothing is behaviourally modelled.
+
+   Concrete sub-steps (in order):
+
+   3a. ~~**Symbol-prefix in `spice_to_c.py`.**~~ Done 2026-05-07.
+       New `--symbol-prefix=<str>` flag prepends to every emitted
+       C identifier (net externs, `presi_clk_prev`, and the per-part
+       `presi_step_part_NNN` functions).  `presi_t`/`PRESI_0`/`PRESI_1`
+       are now under a `PRESI_T_DEFINED` guard so multiple netlist
+       headers can be included by the same TU.  The Makefile per-engine
+       targets pass `--symbol-prefix='<top>__'`; abr_wrap stays
+       prefix-less.  Verified backward-compat (clean abr_wrap rebuild
+       passes NAME/VERSION/STATUS reads) and that `gcc -c` on a
+       prefixed part .c produces an .o whose nm output has only
+       prefixed externs (no `clk`, `reset_n`, etc. at file scope).
+
+   3b. **Per-engine `<engine>_step.c` glue.**  For each engine,
+       generate a small C file that:
+       - declares `extern presi_t <prefix>__<port_bit>` for every
+         engine-side port pin
+       - declares `extern presi_t <abr_wrap_bb_pin>` for the matching
+         abr_wrap-side pin
+       - exposes `<engine>_step(struct presi_model *m)`: copy
+         abr_wrap → engine inputs, call the engine's step function,
+         copy engine outputs → abr_wrap.
+       Pin pairings come from `presi_bb.csv` (abr_wrap side) and the
+       module's port list (engine side -- can read from the
+       `presi_var.h` of the per-engine flow).
+
+   3c. **`abr_seq` controller per-engine flow.**  Currently only the
+       sequencer ROM contents are wired (`make seq-rom`); the FSM
+       around it is still a blackbox in abr_wrap.  Adding a
+       `make abr-seq-core` per-engine target (analogous to
+       `make ntt-top` / `make abr-sampler-top`) gives us the full
+       sequencer-controller gates including the unique-case
+       statement.  This was previously the slowest pass; needs
+       measuring whether it stays under the 5-min cap when isolated
+       from the rest of abr_wrap.
+
+   3d. **Build-system wiring.**  `make presi-gates` link should
+       include the per-engine `presi_var.o` and
+       `presi_clk_part_NNN.o` files for every co-simulated engine,
+       plus the glue files from 3b.  Each engine's flop state is
+       per-TU-static, so co-stepping is N independent
+       `<prefix>__step_netlist()` calls per harness cycle.
+
+   3e. **Drive Dilithium keygen.**  With 3a-3d in place, write
+       `seed_in.dat` / `rnd_in.dat` test vectors via the existing
+       `flow/mldsa-gen.py`, run the harness, byte-compare
+       `pk_out.dat` / `sk_out.dat` against the existing
+       `./abr_wrap` Verilator wrapper.  Deterministic given the
+       same seed.
 
 4. **Stage 5 — first end-to-end operation comparison.**  Once items
    1–2 are in, run mldsa-keygen through the harness, compare

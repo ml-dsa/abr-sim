@@ -192,6 +192,7 @@ $(BUILD)/ntt_top.gates.stat.rpt: $(BUILD)/ntt_top.gates.ys
 $(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/ntt_top.gates.sp \
 		--top ntt_top --num-parts $(NTT_GATE_C_PARTS) \
+		--symbol-prefix 'ntt_top__' \
 		--vars $(BUILD)/ntt_top.presi_var.h \
 		--vars-c $(BUILD)/ntt_top.presi_var.c \
 		--clock $(BUILD)/ntt_top.presi_clk.h --parts-dir $(BUILD) \
@@ -226,6 +227,7 @@ $(BUILD)/abr_sampler_top.gates.json $(BUILD)/abr_sampler_top.gates.stat.rpt: \
 $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_sampler_top.gates.sp \
 		--top abr_sampler_top --num-parts $(SAMPLER_GATE_C_PARTS) \
+		--symbol-prefix 'abr_sampler_top__' \
 		--vars $(BUILD)/abr_sampler_top.presi_var.h \
 		--vars-c $(BUILD)/abr_sampler_top.presi_var.c \
 		--clock $(BUILD)/abr_sampler_top.presi_clk.h --parts-dir $(BUILD) \
