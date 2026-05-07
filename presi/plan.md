@@ -228,7 +228,7 @@ Exit criteria:
   - `abr_seq` is now blackboxed at the SV-module boundary (`gen_yosys.py`'s `ENGINE_MODULES`), since `proc` choked on its 1024-way `unique case` for >25 minutes.  ROM contents come from a quick standalone Yosys run on abr_seq alone (extracted from sv2v.v by `flow/extract_abr_seq.py`); `flow/extract_seq_rom.py` walks the `$mem_v2` cell + the `proc_rom` bit-map net to reconstruct the *full* 87-bit `data_o_rom` value at each of the 1024 ROM addresses (Yosys's proc_rom strips 26 always-zero bit positions, leaving 61 bits in the cell INIT).  `presi/tools/decode_seq_rom.py` validates the ROM against a hand-written reference for `MLDSA_KG_S+0..2`.
   - `presi.c`'s `presi_apply_inputs` / `presi_capture_outputs` copy each abr_wrap top-level port bit between `m->p.*` (32-bit harness representation) and the matching extern `presi_t` (one per netlist bit).  The bit-arrays use a small X-macro list per bus (`haddr_i`, `hwdata_i`, `htrans_i`, `hsize_i`, `hrdata_o`).
   - `presi_cycle()` is a two-step cycle: `presi_step_netlist()` once with `clk = PRESI_0` (settles combinational), then once with `clk = PRESI_1` (rising edge -- DFFs capture).  SRAM tick happens once after the clk=1 step, modelling the synchronous one-cycle read latency of `abr_1r1w_ram`.  Edge-triggered DFFs and topological-sort ordering (see "Simulator semantics" below) make a single step per phase sufficient for consistent reads.
-  - `ahb_read()` holds the address phase for two cycles to align with `abr_ahb_slv_sif`'s registered-address pipeline; the slave's combinational hrdata then reflects this transaction's address rather than the previous one's.  `ahb_write()` is a 3-cycle dance (T1+T2 hold address, T3 presents hwdata) to land hwdata in the slave's data phase rather than during the address-capture window.
+  - `ahb_read()` and `ahb_write()` use the textbook 1-cycle address + 1-cycle data phase.  `abr_ahb_slv_sif` registers (addr, dv, write) at posedge; abr_reg's readback mux is fully combinational from those, and the AHB-side wdata mux is combinational from `hwdata_i` with the lane chosen by registered `addr[2]`.  Earlier code held the address phase for an extra cycle as an empirical workaround for the prior level-sensitive DFF emission, which double-clocked every flop; once `spice_to_c` started emitting the rising-edge predicate `(clk & ~presi_clk_prev)` per DFF, the extra cycle was no longer necessary.
   - Known limitation: **SRAM port-width truncation.**  The pre-hierarchy `blackbox abr_1r1w_ram` keeps every SRAM cell at the *default* port widths (DEPTH=64, DATA_WIDTH=32) regardless of per-instance overrides.  `write_spice` then truncates the wider connections, so the netlist exposes only addr=6 / data=32 to each SRAM (instead of e.g. addr=10 / data=96 for `mem_inst0_bank0`).  The harness's SRAM storage stays at the full declared width so nothing is lost on reads/writes inside the C model, but the netlist itself can only exercise the low 32 data bits and 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox m:*<mod>*` to keep paramod variants, or skipping the SRAM blackbox entirely so memory pass infers `$mem_v2` cells) both push Yosys past the 10-minute build budget; documented in `gen_yosys.py` for follow-up.
 
   What remains:
@@ -333,17 +333,10 @@ operation from running end-to-end.  In rough priority:
    smallest edit that fixes the netlist exposing only addr=6 / data=32
    per SRAM.
 
-4. **AHB-read latency cleanup.**  `ahb_read()` currently holds the
-   address phase for two cycles to align with `abr_ahb_slv_sif`'s
-   registered-address pipeline.  This works but is empirical.  Now
-   that DFFs are edge-triggered and combinational is topo-sorted,
-   the single-cycle textbook AHB protocol may work directly; worth
-   re-checking once we have a real operation to validate against.
-
-5. **Stage 5 — first end-to-end operation.**  Once items 1–2 are in,
+4. **Stage 5 — first end-to-end operation.**  Once items 1–2 are in,
    run `mldsa-keygen` (or the smaller `mlkem-keygen`) through the
    harness, compare `_out.dat` files byte-for-byte against the existing
    `./abr_wrap` Verilator wrapper, record cycle count + runtime.
 
-6. **Stages 6–7.**  Trace hooks and leakage instrumentation, after
+5. **Stages 6–7.**  Trace hooks and leakage instrumentation, after
    Stage 5 lands.

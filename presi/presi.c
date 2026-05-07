@@ -227,15 +227,6 @@ extern presi_t top0_abr_ctrl_inst_zeroize;
  *   stream_msg_buffer_zeroize = field_storage_357 | field_storage_5095
  * which are the two ZEROIZE field flops (MLDSA / MLKEM). */
 extern presi_t top0_abr_ctrl_inst_stream_msg_buffer_zeroize;
-extern presi_t top0_abr_reg_inst_field_storage_357;
-extern presi_t top0_abr_reg_inst_field_storage_5095;
-/* D inputs to the prog_cntr DFFs.  pc[0] D is forced to 1 when
- * stream_msg_buffer_zeroize is high (drives ZEROIZE state); else
- * pc[i] D is whatever the case-logic mux n_80420 produced. */
-extern presi_t n_16132_0;
-extern presi_t n_16132_1;
-extern presi_t n_80420_0;
-extern presi_t n_80420_1;
 /* Higher-level state */
 extern presi_t top0_abr_ctrl_inst_abr_ready;
 extern presi_t top0_abr_ctrl_inst_abr_idle;
@@ -387,27 +378,32 @@ static void presi_reset(struct presi_model *m, unsigned cycles)
     }
 }
 
-static void ahb_clear(struct presi_model *m)
-{
-    presi_drive_idle(m);
-    out_dword(m->p.hwdata_i, 64, 0);
-}
-
+/*
+ * Textbook AHB-Lite, 1-cycle address phase + 1-cycle data phase.
+ *
+ * abr_ahb_slv_sif registers (addr, dv, write) at posedge from the
+ * incoming haddr/hsel/htrans/hwrite.  The downstream abr_reg readback
+ * mux is fully combinational from those registered values, and the
+ * AHB-side wdata mux is combinational from hwdata_i with the lane
+ * selected by the registered addr[2].  So a single-cycle address phase
+ * is sufficient: at the next rising edge the slave latches (addr, dv),
+ * during the data phase hrdata_o reflects this transaction, and
+ * hwdata_i drives the registered field at the data-phase rising edge.
+ *
+ * The earlier 2-cycle address-phase hold was an empirical workaround
+ * for the prior level-sensitive DFF emission, which double-clocked
+ * every flop per harness call.  Now that spice_to_c emits each DFF
+ * with the rising-edge predicate `(clk & ~presi_clk_prev)`, one
+ * presi_cycle equals exactly one logical clock edge, and the textbook
+ * protocol works directly.
+ */
 static void ahb_write(struct presi_model *m, uint32_t addr, uint32_t data)
 {
     uint64_t lane_data;
 
-    /* Mirror ahb_read's 2-cycle address phase + 1-cycle data phase
-     * arrangement.  abr_ahb_slv_sif's registered-address pipeline means
-     * the slave's combinational hrdata (and write-strobe) lag the
-     * incoming address by one cycle, so back-to-back transactions on
-     * tight-1-cycle phases end up either reading from the *previous*
-     * address or writing zeros.  Holding address+control for 2 cycles
-     * and presenting hwdata in the third settles the slave on this
-     * transaction's data. */
     lane_data = (addr & 4u) ? ((uint64_t) data << 32) : (uint64_t) data;
 
-    /* T1+T2: address phase held for two cycles, hwrite=1. */
+    /* Address phase: master drives haddr/hsel/hwrite/htrans=NONSEQ. */
     m->p.hsel_i = PRESI_1;
     m->p.hwrite_i = PRESI_1;
     out_word(m->p.htrans_i, 2, AHB_TRANS_NONSEQ);
@@ -415,9 +411,10 @@ static void ahb_write(struct presi_model *m, uint32_t addr, uint32_t data)
     out_word(m->p.haddr_i, 32, addr);
     out_dword(m->p.hwdata_i, 64, 0);
     presi_cycle(m);
-    presi_cycle(m);
 
-    /* T3: data phase.  Drive the payload on hwdata, address goes IDLE. */
+    /* Data phase: address goes IDLE, hwdata presents the payload.  At
+     * the next rising edge the registered field_storage in abr_reg
+     * samples wdata. */
     presi_drive_idle(m);
     out_dword(m->p.hwdata_i, 64, lane_data);
     presi_cycle(m);
@@ -429,8 +426,7 @@ static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
 {
     uint64_t data;
 
-    /* Address phase: drive haddr/htrans/hsel/hwrite=0 for one cycle.
-     * The slave latches addr+dv at the rising edge inside presi_cycle. */
+    /* Address phase: drive haddr/hsel/htrans=NONSEQ, hwrite=0. */
     m->p.hsel_i = PRESI_1;
     m->p.hwrite_i = PRESI_0;
     out_word(m->p.htrans_i, 2, AHB_TRANS_NONSEQ);
@@ -438,16 +434,8 @@ static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
     out_word(m->p.haddr_i, 32, addr);
     presi_cycle(m);
 
-    /*
-     * Hold the address phase for a SECOND cycle.  The slave's
-     * combinational hrdata_o lags one cycle behind a fresh address
-     * (back-to-back transactions appear shifted by one register
-     * otherwise), so issuing the same address twice means the second
-     * data phase reflects this transaction's address rather than the
-     * previous transaction's. */
-    presi_cycle(m);
-
-    /* Data phase: drive IDLE, then sample after one cycle. */
+    /* Data phase: master drives IDLE; hrdata_o is combinational from
+     * the registered addr and reflects this transaction. */
     presi_drive_idle(m);
     out_dword(m->p.hwdata_i, 64, 0);
     presi_cycle(m);
@@ -564,15 +552,6 @@ int main(int argc, char **argv)
                 unsigned mldsa_cmd = presi_read_bits(presi_mldsa_cmd_reg_bits, 3);
                 unsigned mlkem_cmd = presi_read_bits(presi_mlkem_cmd_reg_bits, 3);
                 unsigned z = top0_abr_ctrl_inst_stream_msg_buffer_zeroize & 1;
-                unsigned z357 = top0_abr_reg_inst_field_storage_357 & 1;
-                unsigned z5095 = top0_abr_reg_inst_field_storage_5095 & 1;
-                unsigned d0 = n_16132_0 & 1;
-                unsigned d1 = n_16132_1 & 1;
-                unsigned m0 = n_80420_0 & 1;
-                unsigned m1 = n_80420_1 & 1;
-                /* Dump every cycle so we can see when zeroize pulses
-                 * and which signal flips it.  No dedup here -- the
-                 * goal is to catch the bouncing pattern. */
                 unsigned rdy = top0_abr_ctrl_inst_abr_ready & 1;
                 unsigned idle = top0_abr_ctrl_inst_abr_idle & 1;
                 unsigned err = top0_abr_ctrl_inst_error_flag_reg & 1;
@@ -582,9 +561,9 @@ int main(int argc, char **argv)
                 if (poll < 16) {
                     printf("[FSM]\tc=%u pc=%u nxt=%u en=%u  "
                            "rdy=%u idle=%u err=%u sub=%u cvv=%u kgp=%u  "
-                           "z=%u d=%u%u mux=%u%u cmd=%u/%u\n",
+                           "z=%u cmd=%u/%u\n",
                            poll, pc, pc_nxt, en, rdy, idle, err, sub, cvv,
-                           kgp, z, d1, d0, m1, m0, mldsa_cmd, mlkem_cmd);
+                           kgp, z, mldsa_cmd, mlkem_cmd);
                 } else if (pc != prev_pc) {
                     if (same_count > 0) {
                         printf("[FSM]\t  ... held for %u cycle%s\n",
