@@ -60,29 +60,32 @@ NUM_PARTS_DEFAULT = 32
 #
 # `__NAME_` is the SPICE form of `$_NAME_` (write_spice replaces the
 # leading `$` with `_`).
+# Each entry: (output_pin_index, lambda(n) -> stmt_string).  The output
+# index is what the topo sort needs to know which net the cell drives;
+# we keep the lambdas verbatim so the emitted C is unchanged.
 COMBINATIONAL = {
     # BUF/NOT/NAND/NOR with the original cmos_cells.v declarations follow
     # input-first order (those modules are not pruned because dfflibmap+abc
     # emit them).  Kept for backward compatibility with the abc-based flow.
-    ("BUF",  2):       lambda n: "%s = %s;" % (n[1], n[0]),
-    ("NOT",  2):       lambda n: "%s = ~%s;" % (n[1], n[0]),
-    ("NAND", 3):       lambda n: "%s = ~(%s & %s);" % (n[2], n[0], n[1]),
-    ("NOR",  3):       lambda n: "%s = ~(%s | %s);" % (n[2], n[0], n[1]),
+    ("BUF",  2):       (1, lambda n: "%s = %s;" % (n[1], n[0])),
+    ("NOT",  2):       (1, lambda n: "%s = ~%s;" % (n[1], n[0])),
+    ("NAND", 3):       (2, lambda n: "%s = ~(%s & %s);" % (n[2], n[0], n[1])),
+    ("NOR",  3):       (2, lambda n: "%s = ~(%s | %s);" % (n[2], n[0], n[1])),
     # Yosys gate primitives.  Output first, then inputs in reverse insertion
     # order.  For symmetric operators the input order is irrelevant.
-    ("__NOT_",     2): lambda n: "%s = ~%s;" % (n[0], n[1]),
-    ("__AND_",     3): lambda n: "%s = %s & %s;" % (n[0], n[2], n[1]),
-    ("__OR_",      3): lambda n: "%s = %s | %s;" % (n[0], n[2], n[1]),
-    ("__NAND_",    3): lambda n: "%s = ~(%s & %s);" % (n[0], n[2], n[1]),
-    ("__NOR_",     3): lambda n: "%s = ~(%s | %s);" % (n[0], n[2], n[1]),
-    ("__XOR_",     3): lambda n: "%s = %s ^ %s;" % (n[0], n[2], n[1]),
-    ("__XNOR_",    3): lambda n: "%s = ~(%s ^ %s);" % (n[0], n[2], n[1]),
+    ("__NOT_",     2): (0, lambda n: "%s = ~%s;" % (n[0], n[1])),
+    ("__AND_",     3): (0, lambda n: "%s = %s & %s;" % (n[0], n[2], n[1])),
+    ("__OR_",      3): (0, lambda n: "%s = %s | %s;" % (n[0], n[2], n[1])),
+    ("__NAND_",    3): (0, lambda n: "%s = ~(%s & %s);" % (n[0], n[2], n[1])),
+    ("__NOR_",     3): (0, lambda n: "%s = ~(%s | %s);" % (n[0], n[2], n[1])),
+    ("__XOR_",     3): (0, lambda n: "%s = %s ^ %s;" % (n[0], n[2], n[1])),
+    ("__XNOR_",    3): (0, lambda n: "%s = ~(%s ^ %s);" % (n[0], n[2], n[1])),
     # SPICE (Y, B, A) maps to Y = A & ~B / Y = A | ~B.
-    ("__ANDNOT_",  3): lambda n: "%s = %s & ~%s;" % (n[0], n[2], n[1]),
-    ("__ORNOT_",   3): lambda n: "%s = %s | ~%s;" % (n[0], n[2], n[1]),
+    ("__ANDNOT_",  3): (0, lambda n: "%s = %s & ~%s;" % (n[0], n[2], n[1])),
+    ("__ORNOT_",   3): (0, lambda n: "%s = %s | ~%s;" % (n[0], n[2], n[1])),
     # SPICE (Y, S, B, A): Y = S ? B : A.
-    ("__MUX_",     4): lambda n:
-        "%s = (%s & 1) ? %s : %s;" % (n[0], n[1], n[2], n[3]),
+    ("__MUX_",     4): (0, lambda n:
+        "%s = (%s & 1) ? %s : %s;" % (n[0], n[1], n[2], n[3])),
 }
 
 
@@ -141,7 +144,7 @@ def parse_instance(line):
     return fields
 
 
-def emit_dff(kind, names, pins, flops, delay_count_box):
+def emit_dff(kind, names, pins, flops):
     """Sequential cell handlers.
 
     For "DFF" (the original library), SPICE order is (C, D, Q) per the
@@ -149,19 +152,15 @@ def emit_dff(kind, names, pins, flops, delay_count_box):
     sets ports in (D, C, Q) order, so the guessed write_spice order is the
     reverse (Q, C, D).
 
-    The xpresi-style cascade trick: when D feeds from another flop's
-    output, capture D in a temporary so cascaded flops still see the
-    previous-cycle value before this cycle's update.
-
     Edge-triggered semantics: the harness owns a `presi_clk_prev` flag
     that mirrors the clock value from the *previous* presi_step_netlist
     call.  We capture D->Q only on a 0->1 transition (`!clk_prev & clk`),
     so multiple step_netlist calls within one logical cycle settle
-    combinational without re-clocking the flop.  Without this, two
-    presi_step_netlist calls per cycle (the existing settle-twice
-    pattern) would tick every flop twice and double the effective clock
-    rate -- the bug that left abr_prog_cntr bouncing between 0 and 1
-    instead of marching through MLDSA_KG_S after a CTRL write.
+    combinational without re-clocking the flop.
+
+    Returns a metadata dict (lhs, rhs, stmt, is_flop) so the
+    translator can topologically sort comb statements without disturbing
+    flop ordering.
     """
     if kind == "DFF":
         clk, d, q = pins
@@ -171,15 +170,9 @@ def emit_dff(kind, names, pins, flops, delay_count_box):
     dref = names.ref(d)
     cref = names.ref(clk)
     edge = "(%s & ~presi_clk_prev & 1)" % cref
-    if d in flops:
-        delay = "_presi_delay_%u" % delay_count_box[0]
-        delay_count_box[0] += 1
-        names.add_synthetic(delay)
-        stmt = "if %s { %s = %s; %s = %s; }" % (edge, qref, delay, delay, dref)
-    else:
-        stmt = "if %s %s = %s;" % (edge, qref, dref)
-    flops.add(q)
-    return stmt
+    stmt = "if %s %s = %s;" % (edge, qref, dref)
+    flops.add(qref)
+    return {"stmt": stmt, "lhs": qref, "rhs": [cref, dref], "is_flop": True}
 
 
 def emit_dffsr(kind, names, pins, flops):
@@ -191,9 +184,11 @@ def emit_dffsr(kind, names, pins, flops):
     the guessed write_spice order is the reverse (Q, D, R, S, C).
 
     Set/reset are level-sensitive (PPP = pos/pos/pos), so they apply
-    regardless of clock.  Only the D->Q transfer is edge-triggered; we
-    use the same `clk & ~presi_clk_prev` rising-edge predicate as
-    emit_dff.
+    regardless of clock.  Only the D->Q transfer is edge-triggered.
+    We treat DFFSR as a flop for topo-sort purposes (Q is "stable
+    during comb"); the level-sensitive S/R override is handled by
+    emitting the DFFSR statement at the end of the cycle, so any
+    comb that reads Q sees the previous cycle's settled value.
     """
     if kind == "DFFSR":
         clk, d, q, s, r = pins
@@ -204,11 +199,13 @@ def emit_dffsr(kind, names, pins, flops):
     rref = names.ref(r)
     dref = names.ref(d)
     cref = names.ref(clk)
-    flops.add(q)
+    flops.add(qref)
     edge = "(%s & ~presi_clk_prev & 1)" % cref
-    return ("if (%s & 1) %s = PRESI_1; else if (%s & 1) %s = PRESI_0; "
+    stmt = ("if (%s & 1) %s = PRESI_1; else if (%s & 1) %s = PRESI_0; "
             "else if %s %s = %s;" %
             (sref, qref, rref, qref, edge, qref, dref))
+    return {"stmt": stmt, "lhs": qref,
+            "rhs": [sref, rref, cref, dref], "is_flop": True}
 
 
 def write_var_header(path, top, ordered_names):
@@ -272,14 +269,72 @@ def write_clk_dispatch(path, num_parts):
             f.write("presi_step_part_%03d();\n" % i)
 
 
+def topo_order_comb(items, flop_outputs):
+    """Kahn's algorithm: order combinational items so each consumer runs
+    after the producer of every wire it reads.  Reads of flop outputs
+    don't create a constraint -- those wires are stable during a comb
+    pass since DFF assignments run at the end of the cycle.
+
+    Items must be the *combinational* subset already (caller filters
+    out is_flop).  Each item has `lhs` (one c_name) and `rhs` (list of
+    c_names; constants and presi_clk_prev should already be filtered).
+    """
+    n = len(items)
+    writer = {}
+    for i, it in enumerate(items):
+        if it["lhs"] is not None:
+            if it["lhs"] in writer:
+                # Multiple drivers for the same net is invalid -- keep
+                # the first writer to make topology deterministic.
+                continue
+            writer[it["lhs"]] = i
+
+    edges_out = [[] for _ in range(n)]
+    in_degree = [0] * n
+    for i, it in enumerate(items):
+        for r in it["rhs"]:
+            if r in flop_outputs:
+                continue
+            j = writer.get(r)
+            if j is None or j == i:
+                continue
+            edges_out[j].append(i)
+            in_degree[i] += 1
+
+    ready = [i for i in range(n) if in_degree[i] == 0]
+    order = []
+    while ready:
+        i = ready.pop()
+        order.append(i)
+        for j in edges_out[i]:
+            in_degree[j] -= 1
+            if in_degree[j] == 0:
+                ready.append(j)
+
+    if len(order) < n:
+        # Combinational cycle: append the remaining items in their
+        # original order (the simulation will need extra settle passes
+        # for these, but we don't refuse to emit).
+        seen = set(order)
+        leftovers = [i for i in range(n) if i not in seen]
+        print("WARNING: %d combinational statements form a cycle, "
+              "appending in original order" % len(leftovers))
+        order.extend(leftovers)
+
+    return [items[i] for i in order]
+
+
 def translate(spice_file, var_header, var_c, clk_dispatch, parts_dir,
               num_parts, map_file, bb_file, top):
     names = NameMap()
-    statements = []
-    flops = set()
-    delay_count_box = [0]
+    items = []  # list of dicts: {stmt, lhs, rhs, is_flop}
+    flops = set()  # c_names of flop outputs
     bb_instances = []  # list of (inst, module, [(spice, c_name)])
     blackbox_modules = {}  # module -> instance count
+
+    def add_comb(lhs, rhs, stmt):
+        items.append({"stmt": stmt, "lhs": lhs, "rhs": rhs,
+                      "is_flop": False})
 
     with open(spice_file, "r", encoding="utf-8") as f:
         for lineno, raw in enumerate(f, 1):
@@ -293,7 +348,7 @@ def translate(spice_file, var_header, var_c, clk_dispatch, parts_dir,
                 if len(fields) >= 4 and fields[3] == "DC":
                     src = names.ref(fields[1])
                     dst = names.ref(fields[2])
-                    statements.append("%s = %s;" % (dst, src))
+                    add_comb(dst, [src], "%s = %s;" % (dst, src))
                     continue
                 raise SystemExit("%s:%d: unsupported voltage source: %s" %
                                  (spice_file, lineno, raw.rstrip()))
@@ -308,31 +363,52 @@ def translate(spice_file, var_header, var_c, clk_dispatch, parts_dir,
             pins = fields[1:-1]
 
             # Combinational primitive.
-            tmpl = COMBINATIONAL.get((module, len(pins)))
-            if tmpl is not None:
+            tmpl_entry = COMBINATIONAL.get((module, len(pins)))
+            if tmpl_entry is not None:
+                out_idx, tmpl = tmpl_entry
                 refs = [names.ref(p) for p in pins]
-                statements.append(tmpl(refs))
+                stmt = tmpl(refs)
+                lhs = refs[out_idx]
+                rhs = [r for j, r in enumerate(refs) if j != out_idx]
+                add_comb(lhs, rhs, stmt)
                 continue
 
             # Sequential primitives.
             if module in ("DFF", "__DFF_P_") and len(pins) == 3:
-                statements.append(
-                    emit_dff(module, names, pins, flops, delay_count_box))
+                items.append(emit_dff(module, names, pins, flops))
                 continue
             if module in ("DFFSR", "__DFFSR_PPP_") and len(pins) == 5:
-                statements.append(emit_dffsr(module, names, pins, flops))
+                items.append(emit_dffsr(module, names, pins, flops))
                 continue
 
             # Anything else: blackbox subcircuit.  Engines, SRAMs, the twiddle
             # ROM, and the surviving $mem_v2 sequencer ROM all land here.  Pins
             # are recorded in their declaration order; the harness writer
-            # cross-references presi_bb.csv to wire them up.
+            # cross-references presi_bb.csv to wire them up.  Blackbox cells
+            # don't drive any nets in this pass (the bb-wiring header drives
+            # rdata_o etc. separately), so they emit only a comment.
             pin_refs = [names.ref(p) for p in pins]
             bb_instances.append((inst, module,
                                  list(zip(pins, pin_refs))))
             blackbox_modules[module] = blackbox_modules.get(module, 0) + 1
-            statements.append("/* blackbox %s %s pins=%d */" %
-                              (inst, module, len(pins)))
+            items.append({"stmt": "/* blackbox %s %s pins=%d */" %
+                          (inst, module, len(pins)),
+                          "lhs": None, "rhs": [], "is_flop": False})
+
+    # Filter constants out of every rhs list.
+    nondep = ("PRESI_0", "PRESI_1", "presi_clk_prev")
+    for it in items:
+        it["rhs"] = [r for r in it["rhs"] if r not in nondep]
+
+    # Split into comb and flop, topologically order the comb half so that
+    # within a single presi_step_netlist call every signal is read after
+    # its driver has been evaluated.  Flop assignments run at the end so
+    # any comb that reads Q sees the previous cycle's settled value.
+    comb = [it for it in items if not it["is_flop"]]
+    flop_items = [it for it in items if it["is_flop"]]
+    comb_ordered = topo_order_comb(comb, flops)
+    statements = [it["stmt"] for it in comb_ordered] + \
+                 [it["stmt"] for it in flop_items]
 
     ordered = [c for c in sorted(names.order)
                if c not in ("PRESI_0", "PRESI_1")]

@@ -209,28 +209,87 @@ Exit criteria:
 
 - Stage 0 is implemented: `make -C presi sv2v` and `make -C presi netlist-blackbox` produce the current artifacts. The `netlist-coarse` target exists for diagnostic dumps but is not built by the default flow.
 - Stage 1 is implemented for the SRAM list: the ten main AB SRAM instances are preserved as black boxes and emitted as C descriptors in `presi/_build/abr_wrap.sram.h`. Per-port C-name binding waits on Stage 4.
-- Stage 2 is implemented. `make -C presi netlist-gates` produces `_build/abr_wrap.gates.sp` (≈209 MB, 4.14 M cells) in ≈150 s with ≈10 GB peak RAM. Two changes were required to fit in the 30 GB box:
+- Stage 2 is implemented. `make -C presi netlist-gates` produces `_build/abr_wrap.gates.sp` (≈209 MB, 4.14 M cells) in ≈3 min with ≈7 GB peak RAM on Yosys 0.64+ (older 0.36 was 5–10× slower on `proc` -- a prerequisite bump).  Three changes were required to fit in the 30 GB box and finish in budget:
   - Run `proc; opt` (with full `opt`, not just `opt_clean`) before `techmap`. Without this fold, sv2v leaves parameter expressions like `$clog2(MLDSA_Q)+1` as runtime arithmetic, generating ~1200 spurious `$mul` cells in `abr_wrap` that techmap then expands to millions of gates.
-  - Skip ABC and the BUF/NOT/NAND/NOR rewrite. Both ran out of memory on the inlined `abr_wrap`. Instead, `simplemap` + `dfflegalize` produce Yosys's gate primitives (`$_AND_`, `$_OR_`, `$_NOT_`, `$_XOR_`, `$_MUX_`, `$_DFF_P_`, `$_DFFSR_PPP_`), which `spice_to_c.py` will translate directly. The presi target needs a correct gate netlist, not optimal area.
-  - Engines blackboxed at their `abr_top`-instantiation boundary: `abr_sampler_top`, `ntt_top`, `power2round_top`, `decompose`, `skencode`, `skdecode_top`, `makehint`, `norm_check_top`, `sigencode_z_top`, `pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`, `decompress_top`, plus `ntt_twiddle_lookup` (4 × 85-entry ROM). The C harness models these behaviorally; per-engine gate-level builds for leakage analysis of one engine at a time are a separate target.
+  - Skip ABC and the BUF/NOT/NAND/NOR rewrite. Both ran out of memory on the inlined `abr_wrap`. Instead, `simplemap` + `dfflegalize` produce Yosys's gate primitives (`$_AND_`, `$_OR_`, `$_NOT_`, `$_XOR_`, `$_MUX_`, `$_DFF_P_`, `$_DFFSR_PPP_`), which `spice_to_c.py` translates directly. The presi target needs a correct gate netlist, not optimal area.
+  - Engines + abr_seq blackboxed at their `abr_top`-instantiation boundary: `abr_sampler_top`, `ntt_top`, `power2round_top`, `decompose`, `skencode`, `skdecode_top`, `makehint`, `norm_check_top`, `sigencode_z_top`, `pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`, `decompress_top`, `abr_seq`, plus `ntt_twiddle_lookup` (4 × 85-entry ROM). The C harness models these behaviorally; per-engine gate-level builds for leakage analysis of one engine at a time are a separate target.  abr_seq specifically was added because `proc` choked on its 1024-way `unique case` (>25 minutes at 100% CPU); a separate `make seq-rom` target runs Yosys on a sliced abr_seq alone (≈10 s) and `extract_seq_rom.py` reassembles the 87-bit ROM table from the post-`proc_rom` `$mem_v2` cell.
 - Stage 3 is implemented. `make -C presi gate-c` runs `spice_to_c.py` over the full SPICE in ≈30 s and emits the netlist as a set of small ANSI-C translation units in `_build/`:
-  - `abr_wrap.presi_var.h` — self-contained header: `presi_t` typedef, `PRESI_0`/`PRESI_1` macros, and one `extern presi_t <name>;` per net.
+  - `abr_wrap.presi_var.h` — self-contained header: `presi_t` typedef, `PRESI_0`/`PRESI_1` macros, the `presi_clk_prev` extern (see "Simulator semantics" below), and one `extern presi_t <name>;` per net.
   - `abr_wrap.presi_var.c` — definitions of every netlist wire (compiled into a single ≈154 MB `.o`).
-  - `abr_wrap.presi_clk_part_NNN.c` — 32 per-part TUs, each holding `void presi_step_part_NNN(void)` with ≈135 k statements.  The split keeps gcc's working set per file at ≈3 GB instead of >12 GB for a monolithic 4.3 M-statement function (which still hadn't produced an `.o` after 5 minutes when interrupted).  Adjust via `GATE_C_PARTS` in the Makefile.
+  - `abr_wrap.presi_clk_part_NNN.c` — 32 per-part TUs, each holding `void presi_step_part_NNN(void)` with ≈135 k statements **in topological order**: comb statements first, ordered so each consumer runs after its driver; DFF/DFFSR assignments grouped at the end.  The split keeps gcc's working set per file at ≈3 GB instead of >12 GB for a monolithic 4.3 M-statement function (which still hadn't produced an `.o` after 5 minutes when interrupted).  Adjust via `GATE_C_PARTS` in the Makefile.
   - `abr_wrap.presi_clk.h` — block-scope `extern` declarations + ordered `presi_step_part_NNN()` calls; included from inside the harness step function.
   - `abr_wrap.presi_map.csv` — SPICE→C name map for debugging.
-  - `abr_wrap.presi_bb.csv` — one row per pin of every blackbox subcircuit instance (`instance, module, pin_index, spice_name, c_name`).  25 instances: 8 `abr_1r1w_ram`, 2 `abr_1r1w_be_ram`, 14 engines, 1 `_mem_v2` (the abr_seq sequencer ROM).
+  - `abr_wrap.presi_bb.csv` — one row per pin of every blackbox subcircuit instance (`instance, module, pin_index, spice_name, c_name`).  26 instances: 8 `abr_1r1w_ram`, 2 `abr_1r1w_be_ram`, 14 engines, 1 `abr_seq` (sequencer ROM blackbox), 1 `ntt_twiddle_lookup`.
   Pin orders for the gate primitives match Yosys's "Guessing order of ports" output (output first, then inputs in reverse insertion order); see the comments in `spice_to_c.py`.  The `(* blackbox *)` declarations one might add to `cmos_cells.v` to avoid the warnings do not work — they get pruned by `hierarchy -check` before simplemap creates the cells.  The Makefile filters those warnings out of the gates log via `grep -v`.
-- Stage 4 is largely implemented.  `make -C presi -j 4 run-gates` builds the full netlist binary and runs it; the abr_wrap NAME register reads back the expected `0x44534d4c` ("MLSD" = low half of "MLDSA-87"), proving end-to-end signal flow from harness → top-level ports → netlist → register file → AHB slave → harness.
-  - `presi/flow/gen_blackbox_wiring.py` reads `presi_bb.csv` plus `sram.json` and generates `_build/abr_wrap.presi_bb_wiring.h`, the body of `presi_sram_tick_all()`.  Each SRAM block samples we/waddr/wdata/re/raddr (and wstrobe for `abr_1r1w_be_ram`) from extern netlist wires, calls the matching `presi_sram_*` helper, and distributes rdata back over the rdata_o bits.  All 10 SRAMs are wired; the 14 engines and the abr_seq sequencer ROM (`_mem_v2`) are listed in the trailing comment as TODO.
+- Stage 4 is implemented.  `make -C presi -j 4 run-gates` builds the full netlist binary and runs it.  After 64 reset cycles plus 64 idle cycles the harness reads `MLDSA_CORE_NAME[31:0]=0x44534d4c`, `MLDSA_CORE_NAME[63:32]=0x3837412d`, `MLDSA_CORE_VERSION[31:0]=0x302e322e`, `MLDSA_CORE_VERSION[63:32]=0x00003300`, and `STATUS=1` (READY bit set).  Writing `MLDSA_CTRL=1` then triggers `MLDSA_KEYGEN` and the controller correctly stalls at MLDSA_KG_S waiting for the (still-stubbed) sampler to acknowledge the first UOP -- proves end-to-end signal flow from harness → top-level ports → netlist → register file → AHB slave → controller → ROM dispatch → engine handshake.
+
+  Pieces that landed in this stage:
+  - `presi/flow/gen_blackbox_wiring.py` reads `presi_bb.csv` plus `sram.json` plus the abr_seq ROM JSON and generates `_build/abr_wrap.presi_bb_wiring.h`, the body of `presi_sram_tick_all()`.  10 SRAMs and the abr_seq ROM are wired; the 14 engines are listed in the trailing comment as TODO.
+  - `abr_seq` is now blackboxed at the SV-module boundary (`gen_yosys.py`'s `ENGINE_MODULES`), since `proc` choked on its 1024-way `unique case` for >25 minutes.  ROM contents come from a quick standalone Yosys run on abr_seq alone (extracted from sv2v.v by `flow/extract_abr_seq.py`); `flow/extract_seq_rom.py` walks the `$mem_v2` cell + the `proc_rom` bit-map net to reconstruct the *full* 87-bit `data_o_rom` value at each of the 1024 ROM addresses (Yosys's proc_rom strips 26 always-zero bit positions, leaving 61 bits in the cell INIT).  `presi/tools/decode_seq_rom.py` validates the ROM against a hand-written reference for `MLDSA_KG_S+0..2`.
   - `presi.c`'s `presi_apply_inputs` / `presi_capture_outputs` copy each abr_wrap top-level port bit between `m->p.*` (32-bit harness representation) and the matching extern `presi_t` (one per netlist bit).  The bit-arrays use a small X-macro list per bus (`haddr_i`, `hwdata_i`, `htrans_i`, `hsize_i`, `hrdata_o`).
-  - `presi_cycle()` is a two-step cycle: first `presi_step_netlist()` with `clk = PRESI_0` to settle combinational, then `clk = PRESI_1` for the rising-edge step that advances flops via the generated `_presi_delay_<n>` temporaries.  SRAM tick happens once after the clk=1 step, modelling the synchronous one-cycle read latency of `abr_1r1w_ram`.  A single-step cycle returned all-zero hrdata even after long resets, which is why we keep both halves.
-  - **AHB reads of all four NAME/VERSION/STATUS registers now read back the expected hardwired constants.**  After 64 reset cycles + 64 idle cycles the harness reads `MLDSA_CORE_NAME[31:0]=0x44534d4c`, `MLDSA_CORE_NAME[63:32]=0x3837412d`, `MLDSA_CORE_VERSION[31:0]=0x302e322e`, `MLDSA_CORE_VERSION[63:32]=0x00003300`, and `STATUS=1` (READY bit set).  The off-by-one register lag previously seen turned out to be a one-cycle alignment between our 2-step `presi_cycle` (which advances flops once per cycle, not twice) and `abr_ahb_slv_sif`'s registered-address pipeline.  The fix is one extra cycle of address phase in `ahb_read()`; the slave's combinational hrdata then reflects this transaction's address rather than the previous one's.
+  - `presi_cycle()` is a two-step cycle: `presi_step_netlist()` once with `clk = PRESI_0` (settles combinational), then once with `clk = PRESI_1` (rising edge -- DFFs capture).  SRAM tick happens once after the clk=1 step, modelling the synchronous one-cycle read latency of `abr_1r1w_ram`.  Edge-triggered DFFs and topological-sort ordering (see "Simulator semantics" below) make a single step per phase sufficient for consistent reads.
+  - `ahb_read()` holds the address phase for two cycles to align with `abr_ahb_slv_sif`'s registered-address pipeline; the slave's combinational hrdata then reflects this transaction's address rather than the previous one's.  `ahb_write()` is a 3-cycle dance (T1+T2 hold address, T3 presents hwdata) to land hwdata in the slave's data phase rather than during the address-capture window.
   - Known limitation: **SRAM port-width truncation.**  The pre-hierarchy `blackbox abr_1r1w_ram` keeps every SRAM cell at the *default* port widths (DEPTH=64, DATA_WIDTH=32) regardless of per-instance overrides.  `write_spice` then truncates the wider connections, so the netlist exposes only addr=6 / data=32 to each SRAM (instead of e.g. addr=10 / data=96 for `mem_inst0_bank0`).  The harness's SRAM storage stays at the full declared width so nothing is lost on reads/writes inside the C model, but the netlist itself can only exercise the low 32 data bits and 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox m:*<mod>*` to keep paramod variants, or skipping the SRAM blackbox entirely so memory pass infers `$mem_v2` cells) both push Yosys past the 10-minute build budget; documented in `gen_yosys.py` for follow-up.
+
   What remains:
-  - Behavioral C models for the 14 engines (start with `abr_sampler_top` and `ntt_top`).  The pin lists are in `presi_bb.csv`.
-  - C model for the abr_seq sequencer ROM (`_mem_v2`).  This is a 1024 × 88-bit ROM holding the FSM's UOPs; without it the controller can't actually execute any operation.  Yosys currently emits it as a single `$mem_v2` blackbox cell (75 pins in our gates flow); init data lives in `gates.json` and the upstream `abr_seq.sv` source.  Plan: extract the init array into a static C table indexed by `abr_prog_cntr_nxt`.
+  - Behavioral C models for the 14 engines (start with `abr_sampler_top` and `ntt_top`).  Without these the controller stalls at the first UOP that needs an engine handshake.  The pin lists are in `presi_bb.csv`.
   - Fix the SRAM port-width truncation so all bits exercise correctly, ideally without doubling Yosys runtime.
+
+## Simulator semantics
+
+`spice_to_c.py` translates a Yosys gates SPICE deck into ANSI C as a flat
+list of statements, then distributes them across 32 part files.  Two
+load-bearing properties keep the resulting simulator cycle-accurate
+without an event-driven scheduler:
+
+1. **Edge-triggered DFFs.**  Each `$_DFF_P_` and `$_DFFSR_PPP_` cell
+   emits as
+   ```c
+   if ((clk & ~presi_clk_prev & 1)) Q = D;
+   ```
+   (DFFSR adds an `if (S) Q=1; else if (R) Q=0;` prefix for the
+   level-sensitive set/reset).  `presi_clk_prev` is a globally-defined
+   `presi_t` that the harness snapshots at the end of every
+   `presi_step_netlist()` call.  So a DFF only ticks once per logical
+   cycle -- the first `clk=1` step after a `clk=0` step.  Multiple
+   `step_netlist()` calls inside one phase settle combinational without
+   re-clocking the flops.
+
+   Without this, the original "Q = D" emission ticked every flop on
+   every step, doubling the effective clock rate.  That bug let
+   register reads work (the slave's pipeline was tolerant) but corrupted
+   any FSM that depended on edge timing -- abr_prog_cntr would
+   "advance" two cycles per harness call.
+
+2. **Combinational statements ordered by dataflow.**  Every cell's
+   emit function returns a `(stmt, lhs, rhs, is_flop)` dict.
+   `topo_order_comb` runs Kahn's algorithm over the comb subset:
+   edges go from "writer of net X" to "reader of net X", with reads of
+   *flop outputs* skipped (those are stable through a cycle since DFF
+   assignments run last).  After topo sort, comb statements are
+   followed by all DFF/DFFSR statements as a single block at the end.
+
+   With this ordering, a single `presi_step_netlist()` call propagates
+   every comb signal through every level of logic in one pass, so a
+   read after the call sees consistent post-edge values.  Before the
+   topo sort, comb signals scattered across the 32 part files were read
+   stale (the part files run in fixed order, but Yosys emits cells in
+   roughly cell-creation order, not dataflow order), which made
+   probes like `top0_abr_ctrl_inst_abr_prog_cntr_nxt_X` and
+   `top0_abr_ctrl_inst_abr_ready` show inconsistent values within the
+   same cycle.
+
+   Combinational cycles in the netlist (rare but possible after opt)
+   trigger a warning and the cyclic statements emit in original order;
+   simulation may need extra settle passes for those signals, but the
+   build doesn't fail.
+
+3. **No cascade-delay temporaries.**  The earlier
+   `Q = delay; delay = D;` pipeline trick existed only to make
+   non-edge-triggered DFFs handle cascaded flops correctly.  With
+   edge-triggered DFFs + dataflow ordering, every D input is the
+   correct combinational of the previous-cycle Q values when its
+   flop ticks, so no temporaries are needed.
 
 ## Initial Implementation Order
 
@@ -247,23 +306,12 @@ and is gated on the engine + abr_seq ROM models below.
 
 ## Where to pick up next
 
-The harness is at the point where it reads the AHB register file
-correctly but cannot execute any operation, because every blackbox
-subcircuit beyond the SRAMs is still a stub.  In rough priority:
+The harness now correctly dispatches a UOP from the abr_seq ROM and
+the controller stalls at MLDSA_KG_S waiting for the (stubbed) sampler
+to acknowledge.  Engine models are the only thing keeping a real
+operation from running end-to-end.  In rough priority:
 
-1. **abr_seq sequencer ROM (`_mem_v2`).**  Single instance, 1024 × 88-bit
-   ROM holding the FSM's UOPs.  The pin list is in `presi_bb.csv`
-   (75 pins: ~61 used data_o_rom bits + 10-bit address `abr_prog_cntr_nxt`
-   + 1 control + clk + 0s + 1s; some output bits were optimised away by
-   Yosys's `opt`).  Init data is in `_build/abr_wrap.gates.json` under
-   the cell's `INIT` parameter — extract it into a static `uint32_t
-   abr_seq_rom[1024][3]` table and add a wiring block in
-   `gen_blackbox_wiring.py` that, on each cycle, reads
-   `abr_prog_cntr_nxt`, looks up the entry, and drives the `data_o_rom`
-   bits that actually appear in the netlist.  Without this the
-   controller has nothing to fetch when MLDSA_CTRL is written.
-
-2. **First engine model: `abr_sampler_top`.**  This is the one used by
+1. **First engine model: `abr_sampler_top`.**  This is the one used by
    essentially every operation (it wraps the SHA3/Keccak sampler).  It
    is purely behavioural for our purposes — translate the upstream
    functional spec (`fips204.py` is a usable reference) into C and
@@ -272,32 +320,30 @@ subcircuit beyond the SRAMs is still a stub.  In rough priority:
    if NTT/encode/decode are still stubs, which gives a real cycle
    trace for the early stages of `mldsa-keygen`.
 
-3. **Remaining 13 engines.**  In order of "needed first" by
+2. **Remaining 13 engines.**  In order of "needed first" by
    `mldsa-keygen` flow: `ntt_top`, `power2round_top`, `skencode`,
    `decompose`, `makehint`, `norm_check_top`, `sigencode_z_top`,
    `pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`,
    `decompress_top`, `skdecode_top`.  All have pin lists in
    `presi_bb.csv`.
 
-4. **SRAM port-width truncation.**  Re-test the post-hierarchy
+3. **SRAM port-width truncation.**  Re-test the post-hierarchy
    `blackbox m:*abr_1r1w_ram*` flow with `opt -fast` (or `synth -fast`)
    to see if it can finish under the 10-minute budget; that's the
    smallest edit that fixes the netlist exposing only addr=6 / data=32
    per SRAM.
 
-5. **AHB-read latency cleanup.**  `ahb_read()` currently holds the
+4. **AHB-read latency cleanup.**  `ahb_read()` currently holds the
    address phase for two cycles to align with `abr_ahb_slv_sif`'s
-   registered-address pipeline.  This works but is an empirical fudge
-   on top of the 2-step `presi_cycle`.  Consider whether a single-step
-   `presi_cycle` plus a post-flop second `presi_step_netlist()` (so
-   combinational propagates the new flop values within the same cycle)
-   would let `ahb_read()` go back to the textbook 1-cycle address
-   phase and get rid of the lag.  Worth a few hours but not blocking.
+   registered-address pipeline.  This works but is empirical.  Now
+   that DFFs are edge-triggered and combinational is topo-sorted,
+   the single-cycle textbook AHB protocol may work directly; worth
+   re-checking once we have a real operation to validate against.
 
-6. **Stage 5 — first end-to-end operation.**  Once items 1–3 are in,
+5. **Stage 5 — first end-to-end operation.**  Once items 1–2 are in,
    run `mldsa-keygen` (or the smaller `mlkem-keygen`) through the
    harness, compare `_out.dat` files byte-for-byte against the existing
    `./abr_wrap` Verilator wrapper, record cycle count + runtime.
 
-7. **Stages 6–7.**  Trace hooks and leakage instrumentation, after
+6. **Stages 6–7.**  Trace hooks and leakage instrumentation, after
    Stage 5 lands.
