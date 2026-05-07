@@ -77,8 +77,10 @@ def c_ident(name):
 
 
 def parse_bb(path):
-    """Return [(instance, module, [(spice_name, c_name), ...]), ...] in
-    csv-file row order; pins per instance are ordered by pin_index."""
+    """Return [(instance, module, [(spice_name, c_name, idx), ...]), ...] in
+    csv-file row order; pins per instance are ordered by pin_index.
+    `idx` is the integer index into presi_s[] for that bit (or -1 for
+    constants like PRESI_0/PRESI_1 that aren't in the array)."""
     rows = []
     with open(path, encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -91,12 +93,15 @@ def parse_bb(path):
         if inst not in seen:
             seen[inst] = (r["module"], [])
             order.append(inst)
-        seen[inst][1].append((int(r["pin_index"]), r["spice_name"], r["c_name"]))
+        seen[inst][1].append(
+            (int(r["pin_index"]), r["spice_name"], r["c_name"],
+             int(r["idx"])))
     out = []
     for inst in order:
         module, pins = seen[inst]
         pins.sort()
-        out.append((inst, module, [(s, c) for _, s, c in pins]))
+        out.append((inst, module,
+                    [(s, c, i) for _, s, c, i in pins]))
     return out
 
 
@@ -131,18 +136,19 @@ def classify_port(base):
 
 
 def group_pins(pins):
-    """Return {port_name: [c_names_lsb_first]} for one SRAM instance."""
+    """Return {port_name: [(c_name, idx), ...]} for one SRAM instance,
+    with bits in LSB-first order."""
     ports = {}
     cur_base = None
     cur_port = None
-    for spice, c_name in pins:
+    for spice, c_name, idx in pins:
         base, _bit = split_port(spice)
         if base != cur_base:
             cur_base = base
             cur_port = classify_port(base)
         if cur_port is None:
             continue
-        ports.setdefault(cur_port, []).append(c_name)
+        ports.setdefault(cur_port, []).append((c_name, idx))
     return ports
 
 
@@ -155,45 +161,70 @@ def lookup_sram_index(srams, we_spice_base):
     raise SystemExit("no SRAM in sram.json matches we_i=%r" % we_spice_base)
 
 
-def emit_in_word(f, dst, names):
-    """Build a uint32_t value from up to 32 single-bit C variables."""
-    if not names:
+# All SRAM bb signals live in the abr_wrap netlist, so we always read
+# them via `presi_s[<idx>]`.  Indices are baked in directly from bb.csv
+# (the integer column emitted by spice_to_c.py).
+
+def _ref(rec):
+    """Return the C expression for a (c_name, idx) record: array index
+    if the bit is in presi_s[], else PRESI_0/PRESI_1 literal."""
+    c_name, idx = rec
+    if idx < 0:
+        return c_name  # "PRESI_0" / "PRESI_1"
+    return "presi_s[%d]" % idx
+
+
+def _lhs_ref(rec):
+    """Same as _ref but for assignment-target context.  Constants are
+    not assignable, so the caller must check idx < 0 separately."""
+    return _ref(rec)
+
+
+def emit_in_word(f, dst, recs):
+    """Build a uint32_t value from up to 32 single-bit netlist signals."""
+    if not recs:
         f.write("\t\t%s = 0u;\n" % dst)
         return
     f.write("\t\t%s = 0u" % dst)
-    for i, n in enumerate(names):
-        f.write(" | ((uint32_t)(%s & 1) << %d)" % (n, i))
+    for i, rec in enumerate(recs):
+        f.write(" | ((uint32_t)(%s & 1) << %d)" % (_ref(rec), i))
     f.write(";\n")
 
 
-def emit_in_words(f, dst_array, names, word_count):
+def emit_in_words(f, dst_array, recs, word_count):
     for w in range(word_count):
-        chunk = names[w * 32:(w + 1) * 32]
+        chunk = recs[w * 32:(w + 1) * 32]
         if not chunk:
             f.write("\t\t%s[%d] = 0u;\n" % (dst_array, w))
             continue
         f.write("\t\t%s[%d] = 0u" % (dst_array, w))
-        for i, n in enumerate(chunk):
-            f.write(" | ((uint32_t)(%s & 1) << %d)" % (n, i))
+        for i, rec in enumerate(chunk):
+            f.write(" | ((uint32_t)(%s & 1) << %d)" % (_ref(rec), i))
         f.write(";\n")
 
 
-def emit_in_strobes(f, dst_array, names, byte_count):
-    """Each strobe variable becomes one whole byte (0xFF or 0x00)."""
+def emit_in_strobes(f, dst_array, recs, byte_count):
+    """Each strobe netlist signal becomes one whole byte (0xFF or 0x00)."""
     for i in range(byte_count):
-        if i < len(names):
+        if i < len(recs):
             f.write("\t\t%s[%d] = (%s & 1) ? 0xFFu : 0x00u;\n" %
-                    (dst_array, i, names[i]))
+                    (dst_array, i, _ref(recs[i])))
         else:
             f.write("\t\t%s[%d] = 0x00u;\n" % (dst_array, i))
 
 
-def emit_out_bits(f, src_array, names):
-    for i, n in enumerate(names):
+def emit_out_bits(f, src_array, recs):
+    """Write engine-output bits back to abr_wrap-side presi_s[] entries.
+    Skip bits whose abr_wrap-side connection is a constant (Yosys folded
+    the unused fanout)."""
+    for i, rec in enumerate(recs):
+        c_name, idx = rec
+        if idx < 0:
+            continue  # constant on abr_wrap side; nothing to drive
         word = i // 32
         bit = i % 32
-        f.write("\t\t%s = ((%s[%d] >> %d) & 1) ? PRESI_1 : PRESI_0;\n" %
-                (n, src_array, word, bit))
+        f.write("\t\tpresi_s[%d] = ((%s[%d] >> %d) & 1) ? PRESI_1 : PRESI_0;\n" %
+                (idx, src_array, word, bit))
 
 
 def emit_sram_block(f, inst_xname, sram_idx, sram, ports):
@@ -213,7 +244,8 @@ def emit_sram_block(f, inst_xname, sram_idx, sram, ports):
     wstrobe = ports.get("wstrobe_i", [])
 
     if we is None or re_ is None:
-        raise SystemExit("%s (%s): missing we_i/re_i pin" % (instance, inst_xname))
+        raise SystemExit("%s (%s): missing we_i/re_i pin" %
+                         (instance, inst_xname))
 
     # KNOWN LIMITATION: Yosys's pre-hierarchy `blackbox abr_1r1w_ram` keeps
     # all SRAM cells at the module's *default* port widths (DEPTH=64,
@@ -238,8 +270,8 @@ def emit_sram_block(f, inst_xname, sram_idx, sram, ports):
              eff_addr_w, len(waddr), len(raddr),
              eff_data_w, len(wdata), len(rdata)))
     f.write("\t{\n")
-    f.write("\t\tunsigned _we = %s & 1;\n" % we)
-    f.write("\t\tunsigned _re = %s & 1;\n" % re_)
+    f.write("\t\tunsigned _we = %s & 1;\n" % _ref(we))
+    f.write("\t\tunsigned _re = %s & 1;\n" % _ref(re_))
     f.write("\t\tuint32_t _waddr;\n")
     emit_in_word(f, "_waddr", waddr)
     f.write("\t\tuint32_t _raddr;\n")
@@ -279,14 +311,15 @@ def split_seq_pins_positional(pins, abits, full_width):
         ("addr_i", abits),
         ("data_o", full_width),
     ]
-    idx = 0
+    pidx = 0
     for name, count in expect:
         chunk = []
         for _ in range(count):
-            if idx >= len(pins):
+            if pidx >= len(pins):
                 break
-            chunk.append(pins[idx][1])  # c_name
-            idx += 1
+            spice, c_name, idx = pins[pidx]
+            chunk.append((c_name, idx))
+            pidx += 1
         if chunk:
             ports[name] = chunk
     return ports
@@ -320,19 +353,21 @@ def emit_seq_block(f, inst_xname, ports, full_width):
             (inst_xname, len(addr_pins), len(data_pins), full_width))
     f.write("\t{\n")
     if en_pins:
-        f.write("\t\tunsigned _en = %s & 1;\n" % en_pins[0])
+        f.write("\t\tunsigned _en = %s & 1;\n" % _ref(en_pins[0]))
     else:
         f.write("\t\tunsigned _en = 0u;  /* no en_i pin */\n")
     f.write("\t\tuint32_t _addr = 0u")
-    for i, n in enumerate(addr_pins):
-        f.write(" | ((uint32_t)(%s & 1) << %d)" % (n, i))
+    for i, rec in enumerate(addr_pins):
+        f.write(" | ((uint32_t)(%s & 1) << %d)" % (_ref(rec), i))
     f.write(";\n")
     f.write("\t\t_addr &= (PRESI_ABR_SEQ_ROM_SIZE - 1u);\n")
-    for i, n in enumerate(data_pins):
+    for i, (c_name, idx) in enumerate(data_pins):
+        if idx < 0:
+            continue  # data_o bit is tied off in abr_wrap (unused)
         word = i // 32
         bit = i % 32
-        f.write("\t\t%s = (_en && ((presi_abr_seq_rom[_addr][%d] >> %d) "
-                "& 1u)) ? PRESI_1 : PRESI_0;\n" % (n, word, bit))
+        f.write("\t\tpresi_s[%d] = (_en && ((presi_abr_seq_rom[_addr][%d] >> %d) "
+                "& 1u)) ? PRESI_1 : PRESI_0;\n" % (idx, word, bit))
     f.write("\t}\n")
 
 
@@ -345,7 +380,7 @@ def emit(out_path, instances, srams, seq_meta):
     for inst, module, pins in instances:
         if module in SRAM_MODULES:
             ports = group_pins(pins)
-            we_pins = [(s, c) for s, c in pins
+            we_pins = [(s, c, i) for s, c, i in pins
                        if classify_port(split_port(s)[0]) == "we_i"]
             if not we_pins:
                 raise SystemExit("%s: no we_i pin found" % inst)

@@ -11,11 +11,16 @@
 
 #ifdef PRESI_HAVE_NETLIST
 /*
- * Generated header: defines `presi_t`, the PRESI_0/PRESI_1 constants, and
- * declares every netlist wire as `extern presi_t <name>;`.  Definitions
- * live in abr_wrap.presi_var.c, compiled into a separate translation unit.
+ * Generated headers: presi_var.h declares the netlist as a single
+ * flat byte array `presi_t presi_s[PRESI_NETS]`; presi_idx.h has
+ * `#define IDX_<c_name> <idx>` entries for every named net so the
+ * harness can index by name.  This replaces the older "one extern
+ * per net" scheme -- huge symbol tables, slow gcc, no cheap delta.
+ * The flat array is what makes per-cycle TVLA toggle counting just
+ * a XOR + popcount loop over presi_s vs a snapshot.
  */
 #include "abr_wrap.presi_var.h"
+#include "abr_wrap.presi_idx.h"
 /*
  * abr_seq sequencer ROM contents extracted from the Yosys gates JSON.
  * Defines `presi_abr_seq_rom[1024][N]`, `PRESI_ABR_SEQ_ROM_SIZE`,
@@ -129,7 +134,7 @@ static void presi_step_netlist(void)
      * predicate (`clk & ~presi_clk_prev`) fires only on a real 0->1
      * transition.  Without this, repeated calls with clk=1 would
      * re-clock every flop and produce double-rate behavior. */
-    presi_clk_prev = clk;
+    presi_clk_prev = presi_s[IDX_clk];
 #endif
 }
 
@@ -155,13 +160,12 @@ static void presi_engines_step(void)
      * lag, which matches the registered handshake conventions between
      * abr_ctrl and the engines).
      *
-     * Skip the engine steps when the controller is idle (busy_o=0).
-     * The engines have nothing to do until a UOP dispatches them, and
-     * each step_glue is ~24% of the per-cycle cost.  Reset (128 cy)
-     * and any post-completion idle are pure win.  Safe because the
-     * engines are also reset on rst_b/zeroize and produce no output
-     * activity in idle. */
-    if (!(busy_o & 1)) return;
+     * Always step.  An earlier `if (!busy_o) return;` skip-when-idle
+     * gate stalled engine flop progression on the cycle after MLDSA_CTRL
+     * was written: busy_o went high one cycle later than the controller
+     * began driving sampler inputs, so the engines missed an early
+     * edge.  Re-introduce a gate only with explicit clk_prev
+     * maintenance during the skipped phases. */
     ntt_top_step_glue();
     abr_sampler_top_step_glue();
 #endif
@@ -170,13 +174,11 @@ static void presi_engines_step(void)
 #ifdef PRESI_HAVE_NETLIST
 
 /*
- * Tables that map each abr_wrap top-level port bit to its extern presi_t
- * in the generated netlist.  The bit order matches m->p.* (LSB at index 0)
- * and the rtl/abr_wrap.sv declarations.
- *
- * Single-bit ports are direct: `extern presi_t clk;`.  Bus ports get one
- * array per bus -- listed by name because C globals can't be indexed at
- * runtime through a single symbol.
+ * Tables that map each abr_wrap top-level port bit to its index into
+ * presi_s[].  IDX_<c_name> is provided by abr_wrap.presi_idx.h.  The
+ * bit order matches m->p.* (LSB at index 0) and the rtl/abr_wrap.sv
+ * declarations.  Multi-bit ports use an array of indices so the
+ * harness can iterate the bus.
  */
 
 #define _PRESI_HADDR_BITS   \
@@ -199,55 +201,38 @@ static void presi_engines_step(void)
 #define _PRESI_HSIZE_BITS   X(0) X(1) X(2)
 #define _PRESI_HRDATA_BITS  _PRESI_HWDATA_BITS
 
-#define X(i) extern presi_t haddr_i_##i;
-_PRESI_HADDR_BITS
-#undef X
-#define X(i) extern presi_t hwdata_i_##i;
-_PRESI_HWDATA_BITS
-#undef X
-#define X(i) extern presi_t htrans_i_##i;
-_PRESI_HTRANS_BITS
-#undef X
-#define X(i) extern presi_t hsize_i_##i;
-_PRESI_HSIZE_BITS
-#undef X
-#define X(i) extern presi_t hrdata_o_##i;
-_PRESI_HRDATA_BITS
-#undef X
-
-static presi_t *const presi_haddr_i_bits[32] = {
-#define X(i) &haddr_i_##i,
+static const int presi_haddr_i_idx[32] = {
+#define X(i) IDX_haddr_i_##i,
     _PRESI_HADDR_BITS
 #undef X
 };
-static presi_t *const presi_hwdata_i_bits[64] = {
-#define X(i) &hwdata_i_##i,
+static const int presi_hwdata_i_idx[64] = {
+#define X(i) IDX_hwdata_i_##i,
     _PRESI_HWDATA_BITS
 #undef X
 };
-static presi_t *const presi_htrans_i_bits[2] = {
-#define X(i) &htrans_i_##i,
+static const int presi_htrans_i_idx[2] = {
+#define X(i) IDX_htrans_i_##i,
     _PRESI_HTRANS_BITS
 #undef X
 };
-static presi_t *const presi_hsize_i_bits[3] = {
-#define X(i) &hsize_i_##i,
+static const int presi_hsize_i_idx[3] = {
+#define X(i) IDX_hsize_i_##i,
     _PRESI_HSIZE_BITS
 #undef X
 };
-static presi_t *const presi_hrdata_o_bits[64] = {
-#define X(i) &hrdata_o_##i,
+static const int presi_hrdata_o_idx[64] = {
+#define X(i) IDX_hrdata_o_##i,
     _PRESI_HRDATA_BITS
 #undef X
 };
 
 /*
- * Internal-state probes.  These reach into the flattened netlist by
- * extern reference -- the names come straight from
- * presi_map.csv (the SPICE->C name table emitted by spice_to_c.py) and
- * exist only as long as the abr_ctrl wires aren't optimised away.  Used
- * by the FSM-trace block in main() so we can watch abr_prog_cntr walk
- * the ROM after a MLDSA_CTRL write.
+ * Internal-state probes.  Names come from presi_map.csv (the
+ * spice_name -> c_name -> idx table emitted by spice_to_c.py) and
+ * exist only as long as the abr_ctrl wires aren't optimised away.
+ * Used by the FSM-trace block in main() so we can watch abr_prog_cntr
+ * walk the ROM after a MLDSA_CTRL write.
  */
 #define _PRESI_PROG_CNTR_BITS \
     X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9)
@@ -255,62 +240,34 @@ static presi_t *const presi_hrdata_o_bits[64] = {
 #define _PRESI_CMD_REG_BITS \
     X(0) X(1) X(2)
 
-#define X(i) extern presi_t top0_abr_ctrl_inst_abr_prog_cntr_##i;
-_PRESI_PROG_CNTR_BITS
-#undef X
-#define X(i) extern presi_t top0_abr_ctrl_inst_abr_prog_cntr_nxt_##i;
-_PRESI_PROG_CNTR_BITS
-#undef X
-#define X(i) extern presi_t top0_abr_ctrl_inst_mldsa_cmd_reg_##i;
-_PRESI_CMD_REG_BITS
-#undef X
-#define X(i) extern presi_t top0_abr_ctrl_inst_mlkem_cmd_reg_##i;
-_PRESI_CMD_REG_BITS
-#undef X
-extern presi_t top0_abr_ctrl_inst_abr_seq_en;
-extern presi_t top0_abr_ctrl_inst_zeroize;
-/* `top0_abr_ctrl_inst_zeroize` is the wire opt-merged with
- * stream_msg_buffer.zeroize -- it tracks the *output* of the OR that
- * feeds the abr_ctrl zeroize signal.  Per spice_to_c output:
- *   stream_msg_buffer_zeroize = field_storage_357 | field_storage_5095
- * which are the two ZEROIZE field flops (MLDSA / MLKEM). */
-extern presi_t top0_abr_ctrl_inst_stream_msg_buffer_zeroize;
-/* Higher-level state */
-extern presi_t top0_abr_ctrl_inst_abr_ready;
-extern presi_t top0_abr_ctrl_inst_abr_idle;
-extern presi_t top0_abr_ctrl_inst_error_flag_reg;
-extern presi_t top0_abr_ctrl_inst_subcomponent_busy;
-extern presi_t top0_abr_ctrl_inst_clear_verify_valid;
-extern presi_t top0_abr_ctrl_inst_mldsa_keygen_process;
-
-static const presi_t *const presi_prog_cntr_bits[10] = {
-#define X(i) &top0_abr_ctrl_inst_abr_prog_cntr_##i,
+static const int presi_prog_cntr_idx[10] = {
+#define X(i) IDX_top0_abr_ctrl_inst_abr_prog_cntr_##i,
     _PRESI_PROG_CNTR_BITS
 #undef X
 };
-static const presi_t *const presi_prog_cntr_nxt_bits[10] = {
-#define X(i) &top0_abr_ctrl_inst_abr_prog_cntr_nxt_##i,
+static const int presi_prog_cntr_nxt_idx[10] = {
+#define X(i) IDX_top0_abr_ctrl_inst_abr_prog_cntr_nxt_##i,
     _PRESI_PROG_CNTR_BITS
 #undef X
 };
-static const presi_t *const presi_mldsa_cmd_reg_bits[3] = {
-#define X(i) &top0_abr_ctrl_inst_mldsa_cmd_reg_##i,
+static const int presi_mldsa_cmd_reg_idx[3] = {
+#define X(i) IDX_top0_abr_ctrl_inst_mldsa_cmd_reg_##i,
     _PRESI_CMD_REG_BITS
 #undef X
 };
-static const presi_t *const presi_mlkem_cmd_reg_bits[3] = {
-#define X(i) &top0_abr_ctrl_inst_mlkem_cmd_reg_##i,
+static const int presi_mlkem_cmd_reg_idx[3] = {
+#define X(i) IDX_top0_abr_ctrl_inst_mlkem_cmd_reg_##i,
     _PRESI_CMD_REG_BITS
 #undef X
 };
 
-static unsigned presi_read_bits(const presi_t *const *bits, int n)
+static unsigned presi_read_bits(const int *bits, int n)
 {
     unsigned v = 0;
     int i;
 
     for (i = 0; i < n; i++) {
-        v |= (unsigned) (*bits[i] & 1) << i;
+        v |= (unsigned) (presi_s[bits[i]] & 1) << i;
     }
     return v;
 }
@@ -323,15 +280,15 @@ static void presi_apply_inputs(struct presi_model *m)
 #ifdef PRESI_HAVE_NETLIST
     int i;
 
-    clk      = m->p.clk;
-    rst_b    = m->p.rst_b;
-    hsel_i   = m->p.hsel_i;
-    hwrite_i = m->p.hwrite_i;
-    hready_i = m->p.hready_i;
-    for (i = 0; i < 32; i++) *presi_haddr_i_bits[i]  = m->p.haddr_i[i];
-    for (i = 0; i < 64; i++) *presi_hwdata_i_bits[i] = m->p.hwdata_i[i];
-    for (i = 0; i <  2; i++) *presi_htrans_i_bits[i] = m->p.htrans_i[i];
-    for (i = 0; i <  3; i++) *presi_hsize_i_bits[i]  = m->p.hsize_i[i];
+    presi_s[IDX_clk]      = m->p.clk;
+    presi_s[IDX_rst_b]    = m->p.rst_b;
+    presi_s[IDX_hsel_i]   = m->p.hsel_i;
+    presi_s[IDX_hwrite_i] = m->p.hwrite_i;
+    presi_s[IDX_hready_i] = m->p.hready_i;
+    for (i = 0; i < 32; i++) presi_s[presi_haddr_i_idx[i]]  = m->p.haddr_i[i];
+    for (i = 0; i < 64; i++) presi_s[presi_hwdata_i_idx[i]] = m->p.hwdata_i[i];
+    for (i = 0; i <  2; i++) presi_s[presi_htrans_i_idx[i]] = m->p.htrans_i[i];
+    for (i = 0; i <  3; i++) presi_s[presi_hsize_i_idx[i]]  = m->p.hsize_i[i];
 #else
     (void) m;
 #endif
@@ -342,12 +299,12 @@ static void presi_capture_outputs(struct presi_model *m)
 #ifdef PRESI_HAVE_NETLIST
     int i;
 
-    m->p.hresp_o     = hresp_o;
-    m->p.hreadyout_o = hreadyout_o;
-    m->p.busy_o      = busy_o;
-    m->p.error_intr  = error_intr;
-    m->p.notif_intr  = notif_intr;
-    for (i = 0; i < 64; i++) m->p.hrdata_o[i] = *presi_hrdata_o_bits[i];
+    m->p.hresp_o     = presi_s[IDX_hresp_o];
+    m->p.hreadyout_o = presi_s[IDX_hreadyout_o];
+    m->p.busy_o      = presi_s[IDX_busy_o];
+    m->p.error_intr  = presi_s[IDX_error_intr];
+    m->p.notif_intr  = presi_s[IDX_notif_intr];
+    for (i = 0; i < 64; i++) m->p.hrdata_o[i] = presi_s[presi_hrdata_o_idx[i]];
 #else
     (void) m;
 #endif
@@ -775,18 +732,18 @@ int main(int argc, char **argv)
             presi_cycle(&model);
 #ifdef PRESI_HAVE_NETLIST
             {
-                unsigned pc = presi_read_bits(presi_prog_cntr_bits, 10);
-                unsigned pc_nxt = presi_read_bits(presi_prog_cntr_nxt_bits, 10);
-                unsigned en = top0_abr_ctrl_inst_abr_seq_en & 1;
-                unsigned mldsa_cmd = presi_read_bits(presi_mldsa_cmd_reg_bits, 3);
-                unsigned mlkem_cmd = presi_read_bits(presi_mlkem_cmd_reg_bits, 3);
-                unsigned z = top0_abr_ctrl_inst_stream_msg_buffer_zeroize & 1;
-                unsigned rdy = top0_abr_ctrl_inst_abr_ready & 1;
-                unsigned idle = top0_abr_ctrl_inst_abr_idle & 1;
-                unsigned err = top0_abr_ctrl_inst_error_flag_reg & 1;
-                unsigned sub = top0_abr_ctrl_inst_subcomponent_busy & 1;
-                unsigned cvv = top0_abr_ctrl_inst_clear_verify_valid & 1;
-                unsigned kgp = top0_abr_ctrl_inst_mldsa_keygen_process & 1;
+                unsigned pc = presi_read_bits(presi_prog_cntr_idx, 10);
+                unsigned pc_nxt = presi_read_bits(presi_prog_cntr_nxt_idx, 10);
+                unsigned en = presi_s[IDX_top0_abr_ctrl_inst_abr_seq_en] & 1;
+                unsigned mldsa_cmd = presi_read_bits(presi_mldsa_cmd_reg_idx, 3);
+                unsigned mlkem_cmd = presi_read_bits(presi_mlkem_cmd_reg_idx, 3);
+                unsigned z = presi_s[IDX_top0_abr_ctrl_inst_stream_msg_buffer_zeroize] & 1;
+                unsigned rdy = presi_s[IDX_top0_abr_ctrl_inst_abr_ready] & 1;
+                unsigned idle = presi_s[IDX_top0_abr_ctrl_inst_abr_idle] & 1;
+                unsigned err = presi_s[IDX_top0_abr_ctrl_inst_error_flag_reg] & 1;
+                unsigned sub = presi_s[IDX_top0_abr_ctrl_inst_subcomponent_busy] & 1;
+                unsigned cvv = presi_s[IDX_top0_abr_ctrl_inst_clear_verify_valid] & 1;
+                unsigned kgp = presi_s[IDX_top0_abr_ctrl_inst_mldsa_keygen_process] & 1;
                 if (poll < 16) {
                     printf("[FSM]\tc=%u pc=%u nxt=%u en=%u  "
                            "rdy=%u idle=%u err=%u sub=%u cvv=%u kgp=%u  "

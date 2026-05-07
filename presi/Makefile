@@ -38,6 +38,7 @@ ABR_SEQ_JSON    := $(BUILD)/abr_seq.standalone.json
 INVENTORY       := $(BUILD)/$(TOP).inventory.txt
 GATES_VAR_H     := $(BUILD)/$(TOP).presi_var.h
 GATES_VAR_C     := $(BUILD)/$(TOP).presi_var.c
+GATES_IDX_H     := $(BUILD)/$(TOP).presi_idx.h
 GATES_CLK_H     := $(BUILD)/$(TOP).presi_clk.h
 GATES_MAP       := $(BUILD)/$(TOP).presi_map.csv
 GATES_BB        := $(BUILD)/$(TOP).presi_bb.csv
@@ -114,7 +115,7 @@ $(GATES_STAMP): $(GATES_SPICE) $(FLOW)/spice_to_c.py
 	@touch $@
 
 # All gate-c outputs are produced atomically by the stamp recipe above.
-$(GATES_VAR_H) $(GATES_VAR_C) $(GATES_CLK_H) $(GATES_MAP) $(GATES_BB) $(GATES_PART_C): $(GATES_STAMP)
+$(GATES_VAR_H) $(GATES_VAR_C) $(GATES_IDX_H) $(GATES_CLK_H) $(GATES_MAP) $(GATES_BB) $(GATES_PART_C): $(GATES_STAMP)
 	@:
 
 # Blackbox wiring header: turns presi_bb.csv pin lists into the body of
@@ -202,6 +203,7 @@ $(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
 
 # All ntt_top gate-c outputs are produced atomically by the stamp.
 $(BUILD)/ntt_top.presi_var.h $(BUILD)/ntt_top.presi_var.c \
+$(BUILD)/ntt_top.presi_idx.h \
 $(BUILD)/ntt_top.presi_clk.h $(BUILD)/ntt_top.presi_map.csv \
 $(BUILD)/ntt_top.presi_bb.csv $(NTT_PART_C): $(BUILD)/ntt_top.gate-c.stamp
 	@:
@@ -243,6 +245,7 @@ $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)
 
 # All abr_sampler_top gate-c outputs are produced atomically by the stamp.
 $(BUILD)/abr_sampler_top.presi_var.h $(BUILD)/abr_sampler_top.presi_var.c \
+$(BUILD)/abr_sampler_top.presi_idx.h \
 $(BUILD)/abr_sampler_top.presi_clk.h $(BUILD)/abr_sampler_top.presi_map.csv \
 $(BUILD)/abr_sampler_top.presi_bb.csv $(SAMPLER_PART_C): \
 		$(BUILD)/abr_sampler_top.gate-c.stamp
@@ -301,35 +304,36 @@ SAMPLER_GLUE_O  := $(BUILD)/abr_sampler_top.glue.o
 
 engine-glue: $(NTT_GLUE_C) $(SAMPLER_GLUE_C)
 
-$(NTT_GLUE_C): $(GATES_BB) $(BUILD)/ntt_top.gates.v \
-               $(BUILD)/ntt_top.presi_var.h $(FLOW)/gen_engine_glue.py
+$(NTT_GLUE_C): $(GATES_BB) $(GATES_MAP) $(BUILD)/ntt_top.gates.v \
+               $(BUILD)/ntt_top.presi_map.csv $(FLOW)/gen_engine_glue.py
 	python3 $(FLOW)/gen_engine_glue.py --engine ntt_top \
 		--abr-wrap-bb $(GATES_BB) \
+		--abr-wrap-map $(GATES_MAP) \
 		--engine-gates-v $(BUILD)/ntt_top.gates.v \
-		--engine-var-h $(BUILD)/ntt_top.presi_var.h \
+		--engine-map $(BUILD)/ntt_top.presi_map.csv \
 		--engine-prefix 'ntt_top__' \
 		--engine-num-parts $(NTT_GATE_C_PARTS) \
-		--gate-on-port ntt_enable --gate-on-port ntt_busy \
 		--out $@
+	# Note: per-engine `--gate-on-port` was removed 2026-05-07.  Gating
+	# inside the glue had a subtle clk_prev staleness bug -- when the
+	# gate skipped a step, the engine's `presi_clk_prev` stayed at the
+	# previous-step's clk, so when the gate next fired the rising-edge
+	# predicate `(clk & ~clk_prev)` could be 0 and miss an edge.  The
+	# outer `busy_o`-based gate in `presi_engines_step()` covers the
+	# common idle case (reset, post-completion).  Re-introduce
+	# per-engine gating only with explicit clk_prev maintenance.
 
-# abr_sampler_top: sampler_busy_o is the "FSM not idle" output (high
-# whenever sampler_start_i is asserted or the FSM has left IDLE), and
-# sha3_start_i / msg_valid_i can also fire SHA3 directly without the
-# rejection-sampler FSM.  Gate on the union to be safe; missing one
-# would skip a phase the controller actually needs.
-$(SAMPLER_GLUE_C): $(GATES_BB) $(BUILD)/abr_sampler_top.gates.v \
-                   $(BUILD)/abr_sampler_top.presi_var.h $(FLOW)/gen_engine_glue.py
+$(SAMPLER_GLUE_C): $(GATES_BB) $(GATES_MAP) $(BUILD)/abr_sampler_top.gates.v \
+                   $(BUILD)/abr_sampler_top.presi_map.csv $(FLOW)/gen_engine_glue.py
 	python3 $(FLOW)/gen_engine_glue.py --engine abr_sampler_top \
 		--abr-wrap-bb $(GATES_BB) \
+		--abr-wrap-map $(GATES_MAP) \
 		--engine-gates-v $(BUILD)/abr_sampler_top.gates.v \
-		--engine-var-h $(BUILD)/abr_sampler_top.presi_var.h \
+		--engine-map $(BUILD)/abr_sampler_top.presi_map.csv \
 		--engine-prefix 'abr_sampler_top__' \
 		--engine-num-parts $(SAMPLER_GATE_C_PARTS) \
-		--gate-on-port sampler_start_i \
-		--gate-on-port sampler_busy_o \
-		--gate-on-port sha3_start_i \
-		--gate-on-port msg_valid_i \
 		--out $@
+	# See ntt_top above re: --gate-on-port removed.
 
 $(NTT_GLUE_O): $(NTT_GLUE_C)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
@@ -371,8 +375,8 @@ $(GATES_VAR_O): $(GATES_VAR_C) $(GATES_VAR_H)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
 $(PRESI_GATES): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) $(GATES_VAR_H) \
-                $(GATES_CLK_H) $(GATES_BB_WIRING) $(GATES_VAR_O) \
-                $(GATES_PART_O) | $(BUILD)
+                $(GATES_IDX_H) $(GATES_CLK_H) $(GATES_BB_WIRING) \
+                $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
 	gcc $(CFLAGS_GATES) -o $@ $(CSRC) $(GATES_VAR_O) $(GATES_PART_O)
 
 # Co-simulation binary: presi-gates plus the per-engine gate netlists
@@ -421,7 +425,8 @@ run-cosim-keygen: $(PRESI_GATES_COSIM)
 	./$(PRESI_GATES_COSIM) keygen $(KEYGEN_MAX_CYCLES)
 
 $(PRESI_GATES_COSIM): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) \
-                $(GATES_VAR_H) $(GATES_CLK_H) $(GATES_BB_WIRING) \
+                $(GATES_VAR_H) $(GATES_IDX_H) $(GATES_CLK_H) \
+                $(GATES_BB_WIRING) \
                 $(GATES_VAR_O) $(GATES_PART_O) \
                 $(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
                 $(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O) \
