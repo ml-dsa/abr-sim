@@ -330,18 +330,39 @@ Current config (the second row) is what `gen_yosys.py` ships:
 
 Priorities, in rough order:
 
-1. **Per-engine gate flow for `ntt_top`.**  Yosys handles ntt_top
-   under 5 min standalone; the kill was on the *combined* cell count
-   inflating spice_to_c output and gcc compile time.  A separate
-   `make ntt-top` target (modeled on the existing `make seq-rom` for
-   `abr_seq`) generates a self-contained gate netlist + per-engine
-   harness for NTT TVLA, used independently of the abr_wrap flow.
+1. **Per-engine gate flow for `ntt_top`.**  Yosys + `spice_to_c.py`
+   pipeline implemented 2026-05-07.  `make ntt-top` produces:
+   - `_build/ntt_top.gates.{sp,v,json,stat.rpt}` — Yosys gates output
+     (2.07 M cells, 24 ports / 1934 port bits, 242 MB SP, ~1m06s).
+   - `_build/ntt_top.presi_var.{h,c}` — extern decls + definitions
+     (one `presi_t` per netlist bit, ~2.78 M lines).
+   - `_build/ntt_top.presi_clk.h` + 8× `ntt_top.presi_clk_part_NNN.c`
+     — topo-sorted cycle update body, ~340 k statements per part.
+   - `_build/ntt_top.presi_{bb,map}.csv` — pin and name maps (bb.csv
+     is empty since engine-gates mode does no blackboxing).
+   Total clean rebuild: ~1m30s, 24s incremental.  Implementation: new
+   `engine-gates` mode in `gen_yosys.py` (skips SRAM/engine blackbox
+   lists, otherwise identical to `gates` mode).
+   **Still needed:** a per-engine C harness that drives ntt_top's
+   input ports cycle-by-cycle (test-vector load + start-pulse +
+   memory-IF model + cycle/toggle observation).  ntt_top's interface
+   is the 24-port set declared in `ntt_top.sv`; the harness needs to
+   model `mem_rd_data` / `pwm_a_rd_data` / `pwm_b_rd_data` (an SRAM
+   stand-in) and capture `mem_wr_req` + `ntt_busy` + `ntt_done`.
 
-2. **Per-engine gate flow for `abr_sampler_top`.**  Likely needs to
-   be split further -- run Yosys on `abr_sha3` alone (Keccak round +
-   pad + state), then on the rejection/CBD/SIB sampler ctrls
-   separately.  SHA3 is the highest-leakage component of ML-DSA so
-   this is the most TVLA-relevant engine to bring up.
+2. **Per-engine gate flow for `abr_sampler_top`.**  Yosys + spice_to_c
+   pipeline implemented 2026-05-07 — *splitting was unnecessary*.
+   Standalone, the whole abr_sampler_top hierarchy (SHA3 + Keccak +
+   rejection / bounded / SIB / CBD samplers + sib_mem) gate-maps to
+   only **2.06 M cells** in **1m52s** end-to-end (Yosys 1m32s +
+   spice_to_c ~20s).  124 MB SPICE, 8 part .c files (~17 MB each),
+   135 K nets reference SHA3/Keccak/sib_mem -- the full SHA3 logic is
+   present in the netlist.  The reason this engine timed out in the
+   *unified* abr_wrap flow was the combined 7 M cell count slowing
+   `proc`/`opt`, not the engine's own size.  Standalone build is
+   well under the 5-min budget.
+   **Still needed:** per-engine C harness for cycle-driving + toggle
+   capture (same shape as the ntt_top harness item above).
 
 3. **Drive the harness through a real mldsa-keygen UOP stream.**
    With the per-coeff engines already gate-mapped, once `abr_sampler_top`

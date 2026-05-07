@@ -51,7 +51,7 @@ ENGINE_MODULES = [
 
 
 def emit_common(f, args):
-    if args.mode == "gates":
+    if args.mode in ("gates", "engine-gates"):
         f.write("read_verilog -lib %s/cmos_cells.v\n" % args.flow_dir)
     f.write("read_verilog -sv %s\n" % args.in_file)
     if args.mode in ("blackbox-sram", "gates"):
@@ -79,9 +79,13 @@ def emit_common(f, args):
     # build budget.  Documented as a follow-up; if revisited, look at
     # cheaper alternatives like `chparam`, manual paramod-named
     # blackboxes in cmos_cells.v, or the `$mem_v2`-infer path.
+    # engine-gates mode (per-engine TVLA flow): no blackboxing.  When
+    # the per-engine top is itself one of ENGINE_MODULES (e.g. ntt_top),
+    # blackboxing it would leave the netlist empty -- and we *want*
+    # everything inside the engine gate-mapped for leakage analysis.
     f.write("hierarchy -check -top %s\n" % args.top)
     f.write("proc\n")
-    if args.mode == "gates":
+    if args.mode in ("gates", "engine-gates"):
         # opt (full, not -fast or opt_clean) folds parameter expressions like
         # $clog2(Q)+1 that sv2v leaves as runtime arithmetic.  Without this,
         # the gates flow techmaps thousands of $mul/$shift/$neg cells that
@@ -94,7 +98,7 @@ def emit_common(f, args):
 
 
 def emit_finish(f, args):
-    if args.mode == "gates":
+    if args.mode in ("gates", "engine-gates"):
         # Custom mapping path that skips ABC and the BUF/NOT/NAND/NOR
         # rewrite.  Both blew the 30 GiB RAM budget on the inlined abr_wrap
         # module (sv2v collapses abr_top + abr_ctrl + abr_mem_top into one
@@ -130,7 +134,9 @@ def emit_finish(f, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", default="abr_wrap")
-    ap.add_argument("--mode", choices=["coarse", "blackbox-sram", "gates"],
+    ap.add_argument("--mode",
+                    choices=["coarse", "blackbox-sram", "gates",
+                             "engine-gates"],
                     default="coarse")
     ap.add_argument("--in", dest="in_file", required=True)
     ap.add_argument("--out", dest="out_file", required=True)
@@ -140,8 +146,8 @@ def main():
     ap.add_argument("--flow-dir", default="flow")
     ap.add_argument("--script", required=True)
     args = ap.parse_args()
-    if args.mode == "gates" and args.spice_out is None:
-        raise SystemExit("--spice-out is required for gates mode")
+    if args.mode in ("gates", "engine-gates") and args.spice_out is None:
+        raise SystemExit("--spice-out is required for %s mode" % args.mode)
 
     with open(args.script, "w", encoding="utf-8") as f:
         emit_common(f, args)

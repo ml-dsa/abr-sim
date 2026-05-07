@@ -55,7 +55,7 @@ PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
 CSRC            := presi.c presi_sram.c
 
-.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom inventory run run-gates clean
+.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top inventory run run-gates clean
 
 all: $(PRESI)
 
@@ -158,6 +158,80 @@ $(ABR_SEQ_JSON): $(ABR_SEQ_YS)
 $(SEQ_ROM_H) $(SEQ_ROM_JSON): $(ABR_SEQ_JSON) $(FLOW)/extract_seq_rom.py
 	python3 $(FLOW)/extract_seq_rom.py --standalone-json $(ABR_SEQ_JSON) \
 		--header $(SEQ_ROM_H) --json $(SEQ_ROM_JSON)
+
+# Per-engine gate flow.  Targets: ntt-top, abr-sampler-top (when needed).
+# Each runs Yosys with `engine-gates` mode (no blackboxing) and emits
+# its own `<engine>.gates.{sp,v,json,stat.rpt}`, then translates the
+# SPICE to C via `spice_to_c.py`.  These are independent of the main
+# abr_wrap flow and exist so engines that don't fit in the unified
+# gates flow's 5-min budget can still be brought up for leakage
+# analysis on their own.  Pipeline: gates.sp -> presi_var.{h,c},
+# presi_clk.h, presi_clk_part_NNN.c (split into NTT_GATE_C_PARTS files
+# for parallel compile), presi_bb.csv, presi_map.csv.  The harness
+# that consumes these is per-engine and lives outside this Makefile.
+
+NTT_GATE_C_PARTS    ?= 8
+NTT_GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(NTT_GATE_C_PARTS))))")
+NTT_PART_C          := $(foreach i,$(NTT_GATE_PART_IDX),$(BUILD)/ntt_top.presi_clk_part_$(i).c)
+
+ntt-top: $(BUILD)/ntt_top.gate-c.stamp
+
+$(BUILD)/ntt_top.gates.ys: $(FLOW)/gen_yosys.py $(FLOW)/cmos_cells.v $(SV2V) | $(BUILD)
+	python3 $(FLOW)/gen_yosys.py --top ntt_top --mode engine-gates \
+		--in $(SV2V) --out $(BUILD)/ntt_top.gates.v \
+		--stat $(BUILD)/ntt_top.gates.stat.rpt \
+		--json-out $(BUILD)/ntt_top.gates.json \
+		--spice-out $(BUILD)/ntt_top.gates.sp \
+		--flow-dir $(FLOW) --script $@
+
+$(BUILD)/ntt_top.gates.sp $(BUILD)/ntt_top.gates.v $(BUILD)/ntt_top.gates.json \
+$(BUILD)/ntt_top.gates.stat.rpt: $(BUILD)/ntt_top.gates.ys
+	timeout $(GATE_TIMEOUT) yosys -q $(BUILD)/ntt_top.gates.ys 2>&1 | \
+		tee $(BUILD)/ntt_top.gates.yosys.log
+
+$(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
+	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/ntt_top.gates.sp \
+		--top ntt_top --num-parts $(NTT_GATE_C_PARTS) \
+		--vars $(BUILD)/ntt_top.presi_var.h \
+		--vars-c $(BUILD)/ntt_top.presi_var.c \
+		--clock $(BUILD)/ntt_top.presi_clk.h --parts-dir $(BUILD) \
+		--map $(BUILD)/ntt_top.presi_map.csv \
+		--bb $(BUILD)/ntt_top.presi_bb.csv
+	@touch $@
+
+# abr_sampler_top per-engine flow.  Includes the SHA3/Keccak hierarchy
+# plus the rejection / bounded / SIB / CBD samplers + an internal sib_mem.
+# Standalone (without the abr_wrap control plane), it is the most
+# TVLA-relevant engine of all.  Same machinery as ntt-top above.
+SAMPLER_GATE_C_PARTS    ?= 8
+SAMPLER_GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(SAMPLER_GATE_C_PARTS))))")
+SAMPLER_PART_C          := $(foreach i,$(SAMPLER_GATE_PART_IDX),$(BUILD)/abr_sampler_top.presi_clk_part_$(i).c)
+
+abr-sampler-top: $(BUILD)/abr_sampler_top.gate-c.stamp
+
+$(BUILD)/abr_sampler_top.gates.ys: $(FLOW)/gen_yosys.py $(FLOW)/cmos_cells.v $(SV2V) | $(BUILD)
+	python3 $(FLOW)/gen_yosys.py --top abr_sampler_top --mode engine-gates \
+		--in $(SV2V) --out $(BUILD)/abr_sampler_top.gates.v \
+		--stat $(BUILD)/abr_sampler_top.gates.stat.rpt \
+		--json-out $(BUILD)/abr_sampler_top.gates.json \
+		--spice-out $(BUILD)/abr_sampler_top.gates.sp \
+		--flow-dir $(FLOW) --script $@
+
+$(BUILD)/abr_sampler_top.gates.sp $(BUILD)/abr_sampler_top.gates.v \
+$(BUILD)/abr_sampler_top.gates.json $(BUILD)/abr_sampler_top.gates.stat.rpt: \
+		$(BUILD)/abr_sampler_top.gates.ys
+	timeout $(GATE_TIMEOUT) yosys -q $(BUILD)/abr_sampler_top.gates.ys 2>&1 | \
+		tee $(BUILD)/abr_sampler_top.gates.yosys.log
+
+$(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)/spice_to_c.py
+	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_sampler_top.gates.sp \
+		--top abr_sampler_top --num-parts $(SAMPLER_GATE_C_PARTS) \
+		--vars $(BUILD)/abr_sampler_top.presi_var.h \
+		--vars-c $(BUILD)/abr_sampler_top.presi_var.c \
+		--clock $(BUILD)/abr_sampler_top.presi_clk.h --parts-dir $(BUILD) \
+		--map $(BUILD)/abr_sampler_top.presi_map.csv \
+		--bb $(BUILD)/abr_sampler_top.presi_bb.csv
+	@touch $@
 
 inventory: $(INVENTORY)
 
