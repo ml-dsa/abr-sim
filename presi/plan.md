@@ -410,22 +410,52 @@ Priorities, in rough order:
        seconds; pattern rules build .glue.o.  Each compiles to a
        ~300 KB .o whose only T-symbol is `<engine>_step_glue`.
 
-   3c. **`abr_seq` controller per-engine flow.**  Currently only the
-       sequencer ROM contents are wired (`make seq-rom`); the FSM
-       around it is still a blackbox in abr_wrap.  Adding a
-       `make abr-seq-core` per-engine target (analogous to
-       `make ntt-top` / `make abr-sampler-top`) gives us the full
-       sequencer-controller gates including the unique-case
-       statement.  This was previously the slowest pass; needs
-       measuring whether it stays under the 5-min cap when isolated
-       from the rest of abr_wrap.
+   3c. ~~**`abr_seq` controller per-engine flow.**~~ Investigated
+       2026-05-07 -- structurally a no-op.  abr_seq has no FSM around
+       its ROM; the entire module *is* the 1024-deep instruction
+       table.  The sequencer FSM that *uses* the ROM lives in
+       `abr_ctrl`, which is already gate-mapped in the abr_wrap
+       unified flow.  Yosys on abr_seq alone produces 1 NOT + 1
+       `$mem_v2` cell in 12 s and the ROM contents are already wired
+       via `make seq-rom` + `gen_blackbox_wiring.py`.  A
+       `make abr-seq-core` target was added for completeness (runs
+       the same engine-gates pipeline so the artifact shape matches
+       the other per-engine flows), but it is not load-bearing for
+       keygen end-to-end.
 
-   3d. **Build-system wiring.**  `make presi-gates` link should
-       include the per-engine `presi_var.o` and
-       `presi_clk_part_NNN.o` files for every co-simulated engine,
-       plus the glue files from 3b.  Each engine's flop state is
-       per-TU-static, so co-stepping is N independent
-       `<prefix>__step_netlist()` calls per harness cycle.
+   3d. ~~**Build-system wiring.**~~ Done 2026-05-07.  `make cosim`
+       builds a new binary `_build/presi-gates-cosim` (~786 MB)
+       linking abr_wrap's no-prefix flow + ntt_top's prefixed flow +
+       abr_sampler_top's prefixed flow + the two `<engine>.glue.o`
+       files.  `presi.c` calls `presi_engines_step()` after each
+       abr_wrap `presi_step_netlist()`; that dispatches to
+       `ntt_top_step_glue()` and `abr_sampler_top_step_glue()`.
+       Compiled with `-DPRESI_HAVE_ENGINE_NETLISTS` so the no-engine
+       `make run-gates` build keeps working.  Also added
+       `parse_engine_externs()` to `gen_engine_glue.py` to filter out
+       port bits that Yosys's standalone engine flow optimized away
+       (no fanout inside the engine), preventing link-time undefined
+       references for those bits.
+
+       **Validation:** with both engines wired, the controller walks
+       past MLDSA_KG_S into real Dilithium keygen UOPs:
+         pc=2 (LD_SHAKE256 entropy)  -> 13 cy
+         pc=3 (SHAKE256 squeeze)     -> 28 cy
+         pc=4 (LFSR, gate-mapped)    -> 2 cy
+         pc=5 (SHAKE256 of seed)     -> 41 cy
+         pc=6 (REJB s1[0])           -> 107 cy
+         pc=7 (REJB s1[1])           -> 57 cy
+       Real engine handshakes (sampler_busy_o up/down, SHA3
+       absorb/squeeze cycles, rejection-bounded sampling) all working
+       through gate-level netlists.
+
+       **Run cost:** ~1m17s wall for 384 cycles total (64+64 reset +
+       256 poll) -- about 5 cyc/s.  Cost comes from stepping 3
+       netlists x 2 phases per logical cycle vs. the original 1
+       netlist x 2 phases.  Acceptable for short bring-up; for full
+       keygen (tens of thousands of cycles) we'll need either -O1
+       compile of the part .c, fewer parts per netlist (less
+       function-call overhead), or simply patience.
 
    3e. **Drive Dilithium keygen.**  With 3a-3d in place, write
        `seed_in.dat` / `rnd_in.dat` test vectors via the existing

@@ -55,7 +55,7 @@ PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
 CSRC            := presi.c presi_sram.c
 
-.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top engine-glue inventory run run-gates clean
+.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top abr-seq-core engine-glue cosim run run-gates run-cosim inventory clean
 
 all: $(PRESI)
 
@@ -200,6 +200,12 @@ $(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
 		--bb $(BUILD)/ntt_top.presi_bb.csv
 	@touch $@
 
+# All ntt_top gate-c outputs are produced atomically by the stamp.
+$(BUILD)/ntt_top.presi_var.h $(BUILD)/ntt_top.presi_var.c \
+$(BUILD)/ntt_top.presi_clk.h $(BUILD)/ntt_top.presi_map.csv \
+$(BUILD)/ntt_top.presi_bb.csv $(NTT_PART_C): $(BUILD)/ntt_top.gate-c.stamp
+	@:
+
 # abr_sampler_top per-engine flow.  Includes the SHA3/Keccak hierarchy
 # plus the rejection / bounded / SIB / CBD samplers + an internal sib_mem.
 # Standalone (without the abr_wrap control plane), it is the most
@@ -235,6 +241,52 @@ $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)
 		--bb $(BUILD)/abr_sampler_top.presi_bb.csv
 	@touch $@
 
+# All abr_sampler_top gate-c outputs are produced atomically by the stamp.
+$(BUILD)/abr_sampler_top.presi_var.h $(BUILD)/abr_sampler_top.presi_var.c \
+$(BUILD)/abr_sampler_top.presi_clk.h $(BUILD)/abr_sampler_top.presi_map.csv \
+$(BUILD)/abr_sampler_top.presi_bb.csv $(SAMPLER_PART_C): \
+		$(BUILD)/abr_sampler_top.gate-c.stamp
+	@:
+
+# abr_seq controller per-engine flow.  abr_seq is blackboxed in the
+# unified abr_wrap flow because its 1024-way `unique case` ROM
+# dispatch stalled `proc` for >25 min on Yosys 0.36 -- documented
+# but possibly fixed on 0.64+ since it brought a `proc_mux`
+# regression fix.  Standalone (no abr_wrap surrounding logic),
+# `make abr-seq-core` runs the same engine-gates pipeline as
+# ntt-top / abr-sampler-top.  If the 5-min cap holds, this gives
+# us the sequencer FSM + ROM combined as gates so the controller
+# can co-simulate alongside abr_wrap.
+SEQ_GATE_C_PARTS    ?= 8
+SEQ_GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(SEQ_GATE_C_PARTS))))")
+SEQ_PART_C          := $(foreach i,$(SEQ_GATE_PART_IDX),$(BUILD)/abr_seq.presi_clk_part_$(i).c)
+
+abr-seq-core: $(BUILD)/abr_seq.gate-c.stamp
+
+$(BUILD)/abr_seq.gates.ys: $(FLOW)/gen_yosys.py $(FLOW)/cmos_cells.v $(SV2V) | $(BUILD)
+	python3 $(FLOW)/gen_yosys.py --top abr_seq --mode engine-gates \
+		--in $(SV2V) --out $(BUILD)/abr_seq.gates.v \
+		--stat $(BUILD)/abr_seq.gates.stat.rpt \
+		--json-out $(BUILD)/abr_seq.gates.json \
+		--spice-out $(BUILD)/abr_seq.gates.sp \
+		--flow-dir $(FLOW) --script $@
+
+$(BUILD)/abr_seq.gates.sp $(BUILD)/abr_seq.gates.v $(BUILD)/abr_seq.gates.json \
+$(BUILD)/abr_seq.gates.stat.rpt: $(BUILD)/abr_seq.gates.ys
+	timeout $(GATE_TIMEOUT) yosys -q $(BUILD)/abr_seq.gates.ys 2>&1 | \
+		tee $(BUILD)/abr_seq.gates.yosys.log
+
+$(BUILD)/abr_seq.gate-c.stamp: $(BUILD)/abr_seq.gates.sp $(FLOW)/spice_to_c.py
+	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_seq.gates.sp \
+		--top abr_seq --num-parts $(SEQ_GATE_C_PARTS) \
+		--symbol-prefix 'abr_seq__' \
+		--vars $(BUILD)/abr_seq.presi_var.h \
+		--vars-c $(BUILD)/abr_seq.presi_var.c \
+		--clock $(BUILD)/abr_seq.presi_clk.h --parts-dir $(BUILD) \
+		--map $(BUILD)/abr_seq.presi_map.csv \
+		--bb $(BUILD)/abr_seq.presi_bb.csv
+	@touch $@
+
 # Per-engine glue: links each engine's standalone gate netlist to its
 # blackbox pin connections in the unified abr_wrap netlist.  Glue C
 # files copy abr_wrap-side bb pin values onto the engine's input
@@ -249,18 +301,22 @@ SAMPLER_GLUE_O  := $(BUILD)/abr_sampler_top.glue.o
 
 engine-glue: $(NTT_GLUE_C) $(SAMPLER_GLUE_C)
 
-$(NTT_GLUE_C): $(GATES_BB) $(BUILD)/ntt_top.gates.v $(FLOW)/gen_engine_glue.py
+$(NTT_GLUE_C): $(GATES_BB) $(BUILD)/ntt_top.gates.v \
+               $(BUILD)/ntt_top.presi_var.h $(FLOW)/gen_engine_glue.py
 	python3 $(FLOW)/gen_engine_glue.py --engine ntt_top \
 		--abr-wrap-bb $(GATES_BB) \
 		--engine-gates-v $(BUILD)/ntt_top.gates.v \
+		--engine-var-h $(BUILD)/ntt_top.presi_var.h \
 		--engine-prefix 'ntt_top__' \
 		--engine-num-parts $(NTT_GATE_C_PARTS) \
 		--out $@
 
-$(SAMPLER_GLUE_C): $(GATES_BB) $(BUILD)/abr_sampler_top.gates.v $(FLOW)/gen_engine_glue.py
+$(SAMPLER_GLUE_C): $(GATES_BB) $(BUILD)/abr_sampler_top.gates.v \
+                   $(BUILD)/abr_sampler_top.presi_var.h $(FLOW)/gen_engine_glue.py
 	python3 $(FLOW)/gen_engine_glue.py --engine abr_sampler_top \
 		--abr-wrap-bb $(GATES_BB) \
 		--engine-gates-v $(BUILD)/abr_sampler_top.gates.v \
+		--engine-var-h $(BUILD)/abr_sampler_top.presi_var.h \
 		--engine-prefix 'abr_sampler_top__' \
 		--engine-num-parts $(SAMPLER_GATE_C_PARTS) \
 		--out $@
@@ -293,6 +349,50 @@ $(PRESI_GATES): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) $(GATES_VAR_H) \
                 $(GATES_CLK_H) $(GATES_BB_WIRING) $(GATES_VAR_O) \
                 $(GATES_PART_O) | $(BUILD)
 	gcc $(CFLAGS_GATES) -o $@ $(CSRC) $(GATES_VAR_O) $(GATES_PART_O)
+
+# Co-simulation binary: presi-gates plus the per-engine gate netlists
+# for ntt_top and abr_sampler_top, glued to abr_wrap's blackbox pins by
+# the .glue.o files.  Built only when the engine artifacts exist (run
+# `make ntt-top abr-sampler-top engine-glue` first).  Defines
+# PRESI_HAVE_ENGINE_NETLISTS so presi.c calls the per-engine step glues.
+NTT_VAR_O           := $(BUILD)/ntt_top.presi_var.o
+SAMPLER_VAR_O       := $(BUILD)/abr_sampler_top.presi_var.o
+NTT_PART_O          := $(foreach i,$(NTT_GATE_PART_IDX),$(BUILD)/ntt_top.presi_clk_part_$(i).o)
+SAMPLER_PART_O      := $(foreach i,$(SAMPLER_GATE_PART_IDX),$(BUILD)/abr_sampler_top.presi_clk_part_$(i).o)
+PRESI_GATES_COSIM   := $(BUILD)/presi-gates-cosim
+CFLAGS_COSIM        := $(CFLAGS_GATES) -DPRESI_HAVE_ENGINE_NETLISTS
+
+# Pattern rules for per-engine .o (var + parts).  Each engine's part .c
+# files and var.c #include their own presi_var.h via spice_to_c.py;
+# the prefix-distinct externs (ntt_top__*, abr_sampler_top__*) keep
+# them link-compatible with abr_wrap's no-prefix flow.
+$(NTT_VAR_O): $(BUILD)/ntt_top.presi_var.c $(BUILD)/ntt_top.gate-c.stamp
+	gcc $(CFLAGS_GATES) -c -o $@ $<
+$(BUILD)/ntt_top.presi_clk_part_%.o: $(BUILD)/ntt_top.presi_clk_part_%.c \
+                                     $(BUILD)/ntt_top.gate-c.stamp
+	gcc $(CFLAGS_GATES) -c -o $@ $<
+
+$(SAMPLER_VAR_O): $(BUILD)/abr_sampler_top.presi_var.c $(BUILD)/abr_sampler_top.gate-c.stamp
+	gcc $(CFLAGS_GATES) -c -o $@ $<
+$(BUILD)/abr_sampler_top.presi_clk_part_%.o: \
+                $(BUILD)/abr_sampler_top.presi_clk_part_%.c \
+                $(BUILD)/abr_sampler_top.gate-c.stamp
+	gcc $(CFLAGS_GATES) -c -o $@ $<
+
+cosim: $(PRESI_GATES_COSIM)
+run-cosim: $(PRESI_GATES_COSIM)
+	./$(PRESI_GATES_COSIM)
+
+$(PRESI_GATES_COSIM): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) \
+                $(GATES_VAR_H) $(GATES_CLK_H) $(GATES_BB_WIRING) \
+                $(GATES_VAR_O) $(GATES_PART_O) \
+                $(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
+                $(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O) \
+                | $(BUILD)
+	gcc $(CFLAGS_COSIM) -o $@ $(CSRC) \
+		$(GATES_VAR_O) $(GATES_PART_O) \
+		$(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
+		$(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O)
 
 run: $(PRESI)
 	./$(PRESI)
