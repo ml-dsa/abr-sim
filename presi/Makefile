@@ -1,7 +1,14 @@
 # Adams Bridge presilicon netlist simulator prototype.
 
 TOP             ?= abr_wrap
-GATE_TIMEOUT    ?= 1800s
+# Hard cap on Yosys gates elaboration.  Measured 2026-05-07 with the
+# per-coefficient engines + ntt_twiddle_lookup un-blackboxed and the
+# heavy hitters (abr_sampler_top, ntt_top, abr_seq) still blackboxed:
+# yosys ~3m17s, full clean rebuild ~5m18s.  300s gives a small safety
+# margin and forces a hard stop if a future change pushes Yosys past
+# what the budget allows.  Override on the command line for one-off
+# experiments only.
+GATE_TIMEOUT    ?= 300s
 ROOT            := ..
 BUILD           := _build
 FLOW            := flow

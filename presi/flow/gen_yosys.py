@@ -21,21 +21,31 @@ SRAM_MODULES = [
 # the gates flow drives the abr_seq blackbox's 87-bit data_o port from the
 # extracted table.
 ENGINE_MODULES = [
-    "ntt_twiddle_lookup",
+    # Engines un-blackboxed 2026-05-07 (gate-mapped for real-engine
+    # leakage analysis -- the project's actual goal):
+    #   ntt_twiddle_lookup  (4 x 85 x 23-bit ROM)
+    #   power2round_top, decompose, skencode, skdecode_top, makehint,
+    #   norm_check_top, sigencode_z_top, pkdecode, sigdecode_z_top,
+    #   sigdecode_h, compress_top, decompress_top
+    # These are 120-400 LoC per-coefficient functions / bit packers
+    # and stay cheap to elaborate.
+    #
+    # Still blackboxed:
+    #   abr_sampler_top -- contains SHA3/Keccak + samplers.  Measured
+    #     2026-05-07: yosys netlist-gates over the 5-min hard cap.
+    #   ntt_top -- NTT butterfly network.  Yosys fits (4m10s) but
+    #     measured 2026-05-07: adding it brings the netlist from 4.79 M
+    #     to 6.86 M cells (+43%), which inflates spice_to_c output to
+    #     ~30-50 MB per part .c file and blows the gcc -O0 compile
+    #     past the 5-min budget (full clean rebuild ~17 min).
+    #   abr_seq -- 1024-way unique-case ROM that stalls `proc` for
+    #     >25 min.  ROM contents come from a separate `make seq-rom`
+    #     standalone Yosys pass.
+    # Use per-engine gate flows (analogous to `make seq-rom`) for SHA3
+    # and NTT leakage analysis -- they are too heavy for the unified
+    # abr_wrap flow on a 5-min iteration budget.
     "abr_sampler_top",
     "ntt_top",
-    "power2round_top",
-    "decompose",
-    "skencode",
-    "skdecode_top",
-    "makehint",
-    "norm_check_top",
-    "sigencode_z_top",
-    "pkdecode",
-    "sigdecode_z_top",
-    "sigdecode_h",
-    "compress_top",
-    "decompress_top",
     "abr_seq",
 ]
 
@@ -59,10 +69,16 @@ def emit_common(f, args):
     # forced to the *default* port widths (DEPTH=64, DATA_WIDTH=32 for
     # abr_1r1w_ram).  write_spice then truncates the wider connections.
     # The harness's SRAM model exercises only those low 32 data bits and
-    # 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox
-    # m:*<mod>*` to keep paramods, or skipping the blackbox so memory pass
-    # infers $mem_v2 cells) both make Yosys take 5+ minutes -- well past
-    # the 10-minute build budget.  Documented as a follow-up in plan.md.
+    # 6 address bits.
+    #
+    # Tried (2026-05-07) and abandoned: deferring SRAM blackbox until
+    # *after* `hierarchy -check -top abr_wrap` (so paramod variants get
+    # per-instance widths) then `blackbox m:*abr_1r1w_ram*`.  Yosys ran
+    # to >25 min / >17 GB RSS in that flow and was still in `proc` /
+    # `opt` when we killed it -- well past the project's 5-minute
+    # build budget.  Documented as a follow-up; if revisited, look at
+    # cheaper alternatives like `chparam`, manual paramod-named
+    # blackboxes in cmos_cells.v, or the `$mem_v2`-infer path.
     f.write("hierarchy -check -top %s\n" % args.top)
     f.write("proc\n")
     if args.mode == "gates":

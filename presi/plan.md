@@ -306,32 +306,75 @@ and is gated on the engine + abr_seq ROM models below.
 
 ## Where to pick up next
 
-The harness now correctly dispatches a UOP from the abr_seq ROM and
-the controller stalls at MLDSA_KG_S waiting for the (stubbed) sampler
-to acknowledge.  Engine models are the only thing keeping a real
-operation from running end-to-end.  In rough priority:
+The harness dispatches a UOP from the abr_seq ROM and stalls at
+MLDSA_KG_S waiting for the sampler.  Behavioural engine models would
+defeat the purpose of *presilicon* leakage testing — the project's
+goal is real-gate toggle traces of the cryptographic engines.  The
+correct architecture is therefore "gate-map as much as fits in the
+build budget; per-engine gate flows for what doesn't."  Measured
+2026-05-07:
 
-1. **First engine model: `abr_sampler_top`.**  This is the one used by
-   essentially every operation (it wraps the SHA3/Keccak sampler).  It
-   is purely behavioural for our purposes — translate the upstream
-   functional spec (`fips204.py` is a usable reference) into C and
-   wire its inputs/outputs through `presi_bb.csv`.  Once
-   `abr_sampler_top` works the controller can start an MLDSA op even
-   if NTT/encode/decode are still stubs, which gives a real cycle
-   trace for the early stages of `mldsa-keygen`.
+| Configuration                            | Yosys | Cells   | Clean rebuild |
+|------------------------------------------|-------|---------|---------------|
+| baseline (control plane only)            | 2:30  | 4.14 M  | ~5 min        |
+| **+ 12 per-coeff engines + twiddle ROM** | 3:17  | 4.79 M  | 5–8 min       |
+| + ntt_top                                | 4:09  | 6.86 M  | 17 min ✗      |
+| + abr_sampler_top                        | >5:00 ✗| –      | –             |
 
-2. **Remaining 13 engines.**  In order of "needed first" by
-   `mldsa-keygen` flow: `ntt_top`, `power2round_top`, `skencode`,
-   `decompose`, `makehint`, `norm_check_top`, `sigencode_z_top`,
-   `pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`,
-   `decompress_top`, `skdecode_top`.  All have pin lists in
-   `presi_bb.csv`.
+Current config (the second row) is what `gen_yosys.py` ships:
+`ntt_twiddle_lookup`, `power2round_top`, `decompose`, `skencode`,
+`skdecode_top`, `makehint`, `norm_check_top`, `sigencode_z_top`,
+`pkdecode`, `sigdecode_z_top`, `sigdecode_h`, `compress_top`,
+`decompress_top` are all real gates.  Only `abr_sampler_top`,
+`ntt_top`, and `abr_seq` are still blackboxed.
 
-3. **SRAM port-width truncation.**  Re-test the post-hierarchy
-   `blackbox m:*abr_1r1w_ram*` flow with `opt -fast` (or `synth -fast`)
-   to see if it can finish under the 10-minute budget; that's the
-   smallest edit that fixes the netlist exposing only addr=6 / data=32
-   per SRAM.
+Priorities, in rough order:
+
+1. **Per-engine gate flow for `ntt_top`.**  Yosys handles ntt_top
+   under 5 min standalone; the kill was on the *combined* cell count
+   inflating spice_to_c output and gcc compile time.  A separate
+   `make ntt-top` target (modeled on the existing `make seq-rom` for
+   `abr_seq`) generates a self-contained gate netlist + per-engine
+   harness for NTT TVLA, used independently of the abr_wrap flow.
+
+2. **Per-engine gate flow for `abr_sampler_top`.**  Likely needs to
+   be split further -- run Yosys on `abr_sha3` alone (Keccak round +
+   pad + state), then on the rejection/CBD/SIB sampler ctrls
+   separately.  SHA3 is the highest-leakage component of ML-DSA so
+   this is the most TVLA-relevant engine to bring up.
+
+3. **Drive the harness through a real mldsa-keygen UOP stream.**
+   With the per-coeff engines already gate-mapped, once `abr_sampler_top`
+   has *any* working glue (even a stub returning known-good data into
+   the SRAM), the FSM should walk past MLDSA_KG_S into the per-coeff
+   block and exercise the gate-mapped engines for real.  Useful for
+   shaking out timing bugs in the AHB/abr_ctrl/engine handshake before
+   investing in the SHA3 model.
+
+4. **Stage 5 — first end-to-end operation comparison.**  Once items
+   1–2 are in, run mldsa-keygen through the harness, compare
+   `_out.dat` byte-for-byte against the existing `./abr_wrap`
+   Verilator wrapper, record cycle count + runtime.
+
+5. **SRAM port-width truncation** (still open from earlier session).
+   Naive post-hierarchy blackbox approach was tried and abandoned
+   2026-05-07; see comments in `gen_yosys.py` and
+   `~/.claude/.../sram_truncation_dead_end.md`.
+
+6. **Stages 6–7.**  Trace hooks and leakage instrumentation, after
+   end-to-end works.
+
+3. **SRAM port-width truncation.**  The naive fix -- defer
+   `blackbox m:*abr_1r1w_ram*` until *after* `hierarchy -check -top`
+   so paramod variants are made with per-instance widths -- was tried
+   on 2026-05-07 and abandoned.  Yosys ran past 25 min / 17 GB RSS in
+   `proc`/`opt` and was killed; the whole gates flow is held to a
+   5-minute budget (`GATE_TIMEOUT=300s` in the Makefile).  Cheaper
+   alternatives to consider before retrying: `chparam` on the original
+   blackbox, manually-named paramod blackboxes in `cmos_cells.v`, or
+   skipping the SRAM blackbox entirely and letting `memory -nomap`
+   infer `$mem_v2` cells (also previously slow but might be retestable
+   on Yosys 0.64+).
 
 4. **Stage 5 — first end-to-end operation.**  Once items 1–2 are in,
    run `mldsa-keygen` (or the smaller `mlkem-keygen`) through the
