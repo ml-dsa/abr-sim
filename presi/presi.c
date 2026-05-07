@@ -35,11 +35,25 @@ typedef uint8_t presi_t;
 #define ABR_STATUS          0x0014u
 #define ABR_ENTROPY         0x0018u
 
+#define MLDSA_SEED          0x0058u
+#define MLDSA_PUBKEY        0x1000u
+#define MLDSA_PRIVKEY_OUT   0x4000u
+
+#define MLDSA_PUBKEY_SZ     2592u
+#define MLDSA_PRIVKEY_SZ    4896u
+#define MLDSA_SEED_SZ       0x20u
+#define ENTROPY_SZ          0x40u
+
+#define CTRL_KEYGEN         1u
+
 #define ABR_STATUS_READY    0x00000001u
 #define ABR_STATUS_VALID    0x00000002u
+#define ABR_STATUS_MLDSA_ERROR  0x00000008u
 
 #define AHB_TRANS_IDLE      0u
 #define AHB_TRANS_NONSEQ    2u
+
+#define SZ_U32(x)           (((x) + 3) / 4)
 
 struct presi_ports {
     presi_t clk;
@@ -461,6 +475,7 @@ static void ahb_write(struct presi_model *m, uint32_t addr, uint32_t data)
 static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
 {
     uint64_t data;
+    unsigned wait;
 
     /* Address phase: drive haddr/hsel/htrans=NONSEQ, hwrite=0. */
     m->p.hsel_i = PRESI_1;
@@ -475,8 +490,174 @@ static uint32_t ahb_read(struct presi_model *m, uint32_t addr)
     presi_drive_idle(m);
     out_dword(m->p.hwdata_i, 64, 0);
     presi_cycle(m);
+
+    /* External-region reads (PUBKEY / PRIVKEY / SIGNATURE / etc.)
+     * route through abr_reg's external_pending logic and stall the
+     * AHB slave (hreadyout_o = 0) for several cycles while the
+     * underlying SRAM responds.  Spin until the slave releases the
+     * stall or we hit a sanity cap. */
+    for (wait = 0; wait < 1024 && !(m->p.hreadyout_o & 1); wait++) {
+        presi_drive_idle(m);
+        out_dword(m->p.hwdata_i, 64, 0);
+        presi_cycle(m);
+    }
     data = in_dword(m->p.hrdata_o, 64);
     return (uint32_t) ((addr & 4u) ? (data >> 32) : data);
+}
+
+/* Read a binary file into a uint32_t buffer (little-endian within
+ * each 32-bit word, matching the AHB lane mapping abr_reg expects).
+ * Zero-pads the rest of buf.  Returns bytes read. */
+static size_t read_dat(uint32_t *buf, size_t bufsz, const char *fn,
+                       int optional)
+{
+    FILE *fp;
+    size_t n;
+
+    memset(buf, 0, bufsz);
+    fp = fopen(fn, "rb");
+    if (fp == NULL) {
+        if (optional)
+            return 0;
+        perror(fn);
+        exit(1);
+    }
+    n = fread(buf, 1, bufsz, fp);
+    fclose(fp);
+    printf("[LOAD]\t%s (read %zu bytes)\n", fn, n);
+    return n;
+}
+
+static size_t write_dat(const uint32_t *buf, size_t bufsz, const char *fn)
+{
+    FILE *fp;
+    size_t n;
+
+    fp = fopen(fn, "wb");
+    if (fp == NULL) {
+        perror(fn);
+        exit(1);
+    }
+    n = fwrite(buf, 1, bufsz, fp);
+    fclose(fp);
+    printf("[SAVE]\t%s (wrote %zu bytes)\n", fn, n);
+    return n;
+}
+
+/* Block AHB writes / reads: one 32-bit word per stride. */
+static void ahb_write_block(struct presi_model *m, uint32_t addr,
+                            const uint32_t *data, size_t words)
+{
+    size_t i;
+    for (i = 0; i < words; i++) {
+        ahb_write(m, addr + (uint32_t)(i * 4), data[i]);
+    }
+}
+
+static void ahb_read_block(struct presi_model *m, uint32_t addr,
+                           uint32_t *data, size_t words)
+{
+    size_t i;
+    for (i = 0; i < words; i++) {
+        data[i] = ahb_read(m, addr + (uint32_t)(i * 4));
+    }
+}
+
+/* Step the harness until STATUS has the desired bits set, or hit
+ * max_cycles.  Reports STATUS transitions when verbose != 0.  Returns
+ * the final status, or -1 on timeout. */
+static int wait_for_status(struct presi_model *m, uint32_t want_mask,
+                           uint32_t error_mask,
+                           uint64_t max_cycles, int verbose)
+{
+    int prev = -1;
+    uint64_t start = m->cycle;
+    uint64_t deadline = start + max_cycles;
+
+    for (;;) {
+        uint32_t st;
+        if (m->cycle >= deadline) {
+            return -1;
+        }
+        st = ahb_read(m, ABR_STATUS);
+        if (verbose && (int) st != prev) {
+            printf("[STAT]\tcycle=%llu  status=%08x%s%s%s\n",
+                   (unsigned long long) m->cycle, st,
+                   (st & ABR_STATUS_READY) ? " READY" : "",
+                   (st & ABR_STATUS_VALID) ? " VALID" : "",
+                   (st & error_mask)       ? " ERROR" : "");
+            prev = (int) st;
+        }
+        if (st & error_mask) {
+            return (int) st;
+        }
+        if ((st & want_mask) == want_mask) {
+            return (int) st;
+        }
+        /* Quietly advance a few cycles between status reads to keep
+         * AHB traffic from dominating the trace. */
+        {
+            int j;
+            for (j = 0; j < 32 && m->cycle < deadline; j++) {
+                presi_cycle(m);
+            }
+        }
+    }
+}
+
+/* Drive a full ML-DSA-87 keygen via the AHB interface and write
+ * pk_out.dat / sk_out.dat.  Inputs are read from the standard files
+ * (ent_in.dat, seed_in.dat -- generate via flow/mldsa-gen.py).
+ * Returns 0 on success, non-zero on timeout / error-status. */
+static int mldsa_keygen(struct presi_model *m, uint64_t max_cycles)
+{
+    uint32_t entropy[SZ_U32(ENTROPY_SZ)] = {0};
+    uint32_t seed[SZ_U32(MLDSA_SEED_SZ)] = {0};
+    uint32_t pk[SZ_U32(MLDSA_PUBKEY_SZ)] = {0};
+    uint32_t sk[SZ_U32(MLDSA_PRIVKEY_SZ)] = {0};
+    uint64_t cycle_at_start, cycle_after_xfer, cycle_at_done;
+    int st;
+
+    read_dat(entropy, ENTROPY_SZ, "ent_in.dat", 1);
+    read_dat(seed,    MLDSA_SEED_SZ, "seed_in.dat", 0);
+
+    cycle_at_start = m->cycle;
+    printf("[KGEN]\tcycle=%llu  loading entropy + seed\n",
+           (unsigned long long) cycle_at_start);
+    ahb_write_block(m, ABR_ENTROPY, entropy, SZ_U32(ENTROPY_SZ));
+    ahb_write_block(m, MLDSA_SEED,  seed,    SZ_U32(MLDSA_SEED_SZ));
+
+    cycle_after_xfer = m->cycle;
+    printf("[KGEN]\tcycle=%llu  writing CTRL=KEYGEN\n",
+           (unsigned long long) cycle_after_xfer);
+    ahb_write(m, ABR_CTRL, CTRL_KEYGEN);
+
+    st = wait_for_status(m, ABR_STATUS_READY | ABR_STATUS_VALID,
+                         ABR_STATUS_MLDSA_ERROR, max_cycles, 1);
+    cycle_at_done = m->cycle;
+    if (st < 0) {
+        printf("[KGEN]\tTIMEOUT after %llu cycles\n",
+               (unsigned long long) (cycle_at_done - cycle_at_start));
+        return 1;
+    }
+    if (st & ABR_STATUS_MLDSA_ERROR) {
+        printf("[KGEN]\tERROR status=%08x\n", (unsigned) st);
+        return 2;
+    }
+    printf("[KGEN]\tdone in %llu cycles (load=%llu, run=%llu)\n",
+           (unsigned long long) (cycle_at_done - cycle_at_start),
+           (unsigned long long) (cycle_after_xfer - cycle_at_start),
+           (unsigned long long) (cycle_at_done - cycle_after_xfer));
+
+    printf("[KGEN]\treading public key (%u bytes)\n", MLDSA_PUBKEY_SZ);
+    ahb_read_block(m, MLDSA_PUBKEY, pk, SZ_U32(MLDSA_PUBKEY_SZ));
+    write_dat(pk, MLDSA_PUBKEY_SZ, "pk_out.dat");
+
+    printf("[KGEN]\treading private key (%u bytes)\n", MLDSA_PRIVKEY_SZ);
+    ahb_read_block(m, MLDSA_PRIVKEY_OUT, sk, SZ_U32(MLDSA_PRIVKEY_SZ));
+    write_dat(sk, MLDSA_PRIVKEY_SZ, "sk_out.dat");
+
+    return 0;
 }
 
 static int presi_init(struct presi_model *m)
@@ -504,9 +685,13 @@ int main(int argc, char **argv)
 {
     struct presi_model model;
     unsigned i;
+    const char *op_name = (argc > 1) ? argv[1] : "smoke";
+    uint64_t max_cycles = 200000;
 
-    (void) argc;
-    (void) argv;
+    if (argc > 2) {
+        max_cycles = strtoull(argv[2], NULL, 0);
+    }
+
     memset(&model, 0, sizeof(model));
 
     printf("[INIT]\tpresi harness\n");
@@ -556,6 +741,14 @@ int main(int argc, char **argv)
            ahb_read(&model, 0x0c));
     printf("[BUS]\tSTATUS     =%08x  (READY bit expected = 1)\n",
            ahb_read(&model, 0x14));
+
+    if (strcmp(op_name, "keygen") == 0 ||
+        strcmp(op_name, "mldsa-keygen") == 0) {
+        int rc = mldsa_keygen(&model, max_cycles);
+        presi_free(&model);
+        return rc;
+    }
+
     ahb_write(&model, ABR_ENTROPY, 0);
 
     /*

@@ -55,7 +55,7 @@ PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
 CSRC            := presi.c presi_sram.c
 
-.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top abr-seq-core engine-glue cosim run run-gates run-cosim inventory clean
+.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top abr-seq-core engine-glue cosim run run-gates run-cosim run-cosim-keygen inventory clean
 
 all: $(PRESI)
 
@@ -405,8 +405,20 @@ $(BUILD)/abr_sampler_top.presi_clk_part_%.o: \
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
 cosim: $(PRESI_GATES_COSIM)
+
+# Smoke run -- kicks the FSM with the existing 256-cycle poll trace.
 run-cosim: $(PRESI_GATES_COSIM)
 	./$(PRESI_GATES_COSIM)
+
+# Real Dilithium keygen.  Generate inputs first via the project root
+# (`flow/mldsa-gen.py keygen`), then run from this directory so the
+# binary picks up `ent_in.dat` / `seed_in.dat` from the current dir
+# and writes `pk_out.dat` / `sk_out.dat`.  KEYGEN_MAX_CYCLES caps
+# the run time -- bump if the run hits the timeout.
+KEYGEN_MAX_CYCLES   ?= 200000
+
+run-cosim-keygen: $(PRESI_GATES_COSIM)
+	./$(PRESI_GATES_COSIM) keygen $(KEYGEN_MAX_CYCLES)
 
 $(PRESI_GATES_COSIM): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) \
                 $(GATES_VAR_H) $(GATES_CLK_H) $(GATES_BB_WIRING) \
