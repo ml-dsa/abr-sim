@@ -190,8 +190,34 @@ def parse_bb(path, instance, module):
 CONSTANT_C_NAMES = ("PRESI_0", "PRESI_1")
 
 
+def find_gate_pins(gates, pin_seq, bb_rows):
+    """Return list of abr_wrap-side c_names for the requested gating
+    ports.  `gates` is a list of port names (e.g. 'ntt_enable',
+    'ntt_busy').  All bits of each gating port are included so
+    multi-bit gates like a `mode` field also work."""
+    out = []
+    for gate in gates:
+        matched = False
+        for (port, bit, direction, count), (pin_idx, abr_c) in zip(
+                pin_seq, bb_rows):
+            if port != gate:
+                continue
+            matched = True
+            if abr_c in CONSTANT_C_NAMES:
+                # A gating port tied to a constant in abr_wrap is
+                # always either 0 (effectively never gates on) or 1
+                # (always gates on); skip -- the user's intent is
+                # almost certainly the variable signal.
+                continue
+            out.append(abr_c)
+        if not matched:
+            raise SystemExit(
+                "gate-on port %r not found in engine port list" % gate)
+    return out
+
+
 def emit_glue(out_path, engine, instance, prefix, num_parts,
-              pin_seq, bb_rows, engine_syms):
+              pin_seq, bb_rows, engine_syms, gate_pins):
     """Emit a single glue C file with extern decls and the
     `<engine>_step_glue` function."""
     # Sanity-check: pin_seq and bb_rows must have the same length.
@@ -251,6 +277,28 @@ def emit_glue(out_path, engine, instance, prefix, num_parts,
 
         # Emit the step glue.
         f.write("\nvoid %s_step_glue(void)\n{\n" % engine)
+
+        # Optional runtime gate: skip the entire glue + step when
+        # none of the gating signals are asserted.  Caller passes
+        # in port names (typically the engine's start-input + busy-
+        # output) via --gate-on-port.  All bits of the named ports
+        # are OR'd; if all zero, return early.  Saves ~one engine's
+        # worth of cycle time during phases where the controller is
+        # using the *other* engine.
+        if gate_pins:
+            f.write("\t/* runtime gate: skip step when none of the\n"
+                    "\t * named gating signals are asserted.  Saves an\n"
+                    "\t * engine's worth of cycle time during phases\n"
+                    "\t * where the controller is using a *different*\n"
+                    "\t * engine.  Caller passes the gate signal names\n"
+                    "\t * via gen_engine_glue.py --gate-on-port. */\n")
+            f.write("\tif (!(")
+            for i, abr_c in enumerate(gate_pins):
+                if i:
+                    f.write("\n\t      | ")
+                f.write("(%s & 1)" % abr_c)
+            f.write(")) return;\n\n")
+
         f.write("\t/* abr_wrap -> engine inputs */\n")
         for (port, bit, direction, count), (pin_idx, abr_c) in zip(pin_seq,
                                                                     bb_rows):
@@ -336,6 +384,13 @@ def main():
                     help="path to engine's <engine>.presi_var.h "
                          "(used to filter out port bits Yosys "
                          "optimized away from the engine netlist)")
+    ap.add_argument("--gate-on-port", action="append", default=[],
+                    help="port name whose value should be checked at "
+                         "step_glue entry; if all `--gate-on-port` "
+                         "values are zero, the step is skipped.  All "
+                         "bits of the port are OR'd.  Repeat to gate "
+                         "on multiple ports (e.g. an enable-input plus "
+                         "the busy-output).")
     ap.add_argument("--out", required=True,
                     help="output C file (the per-engine glue)")
     args = ap.parse_args()
@@ -344,16 +399,17 @@ def main():
     pin_seq = engine_pin_seq(ports)
     instance, bb_rows = parse_bb(args.abr_wrap_bb, args.instance, args.engine)
     engine_syms = parse_engine_externs(args.engine_var_h)
+    gate_pins = find_gate_pins(args.gate_on_port, pin_seq, bb_rows)
 
     (total, ins, outs, skipped, const_in,
      dead_in, dead_out) = emit_glue(
         args.out, args.engine, instance, args.engine_prefix,
-        args.engine_num_parts, pin_seq, bb_rows, engine_syms)
+        args.engine_num_parts, pin_seq, bb_rows, engine_syms, gate_pins)
     print("engine-glue: %s/%s -> %s (%d bits, %d in (%d const-tied, "
           "%d dead-in-engine), %d out (%d const-in-abr_wrap, "
-          "%d dead-in-engine))" %
+          "%d dead-in-engine), %d gate-bits)" %
           (args.engine, instance, args.out, total, ins, const_in, dead_in,
-           outs, skipped, dead_out))
+           outs, skipped, dead_out, len(gate_pins)))
 
 
 if __name__ == "__main__":

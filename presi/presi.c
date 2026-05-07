@@ -139,7 +139,15 @@ static void presi_engines_step(void)
      * combinational values; the engine outputs we write back become
      * inputs to abr_wrap's combinational on the *next* step (one-phase
      * lag, which matches the registered handshake conventions between
-     * abr_ctrl and the engines). */
+     * abr_ctrl and the engines).
+     *
+     * Skip the engine steps when the controller is idle (busy_o=0).
+     * The engines have nothing to do until a UOP dispatches them, and
+     * each step_glue is ~24% of the per-cycle cost.  Reset (128 cy)
+     * and any post-completion idle are pure win.  Safe because the
+     * engines are also reset on rst_b/zeroize and produce no output
+     * activity in idle. */
+    if (!(busy_o & 1)) return;
     ntt_top_step_glue();
     abr_sampler_top_step_glue();
 #endif

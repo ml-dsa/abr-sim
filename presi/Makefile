@@ -309,8 +309,14 @@ $(NTT_GLUE_C): $(GATES_BB) $(BUILD)/ntt_top.gates.v \
 		--engine-var-h $(BUILD)/ntt_top.presi_var.h \
 		--engine-prefix 'ntt_top__' \
 		--engine-num-parts $(NTT_GATE_C_PARTS) \
+		--gate-on-port ntt_enable --gate-on-port ntt_busy \
 		--out $@
 
+# abr_sampler_top: sampler_busy_o is the "FSM not idle" output (high
+# whenever sampler_start_i is asserted or the FSM has left IDLE), and
+# sha3_start_i / msg_valid_i can also fire SHA3 directly without the
+# rejection-sampler FSM.  Gate on the union to be safe; missing one
+# would skip a phase the controller actually needs.
 $(SAMPLER_GLUE_C): $(GATES_BB) $(BUILD)/abr_sampler_top.gates.v \
                    $(BUILD)/abr_sampler_top.presi_var.h $(FLOW)/gen_engine_glue.py
 	python3 $(FLOW)/gen_engine_glue.py --engine abr_sampler_top \
@@ -319,6 +325,10 @@ $(SAMPLER_GLUE_C): $(GATES_BB) $(BUILD)/abr_sampler_top.gates.v \
 		--engine-var-h $(BUILD)/abr_sampler_top.presi_var.h \
 		--engine-prefix 'abr_sampler_top__' \
 		--engine-num-parts $(SAMPLER_GATE_C_PARTS) \
+		--gate-on-port sampler_start_i \
+		--gate-on-port sampler_busy_o \
+		--gate-on-port sha3_start_i \
+		--gate-on-port msg_valid_i \
 		--out $@
 
 $(NTT_GLUE_O): $(NTT_GLUE_C)
@@ -335,7 +345,22 @@ $(INVENTORY): $(BLACKBOX_JSON) $(FLOW)/netlist_inventory.py
 $(PRESI): $(CSRC) presi_sram.h $(SRAM_H) | $(BUILD)
 	gcc -std=c99 -Wall -Wextra -O0 -I$(BUILD) -I. -o $@ $(CSRC)
 
-CFLAGS_GATES    := -std=c99 -Wall -Wextra -O0 -DPRESI_HAVE_NETLIST \
+# Optimization level for the giant generated gate-update files.
+# Measurements 2026-05-07 on the 49 MB ntt_top.presi_clk_part_001.c:
+#   gcc -O0    17 s   <-- default
+#   clang -O0  13 s
+#   gcc -Og    48 s
+#   gcc -O1   ~5 min
+#   gcc -O1 -fno-tree-pre -fno-tree-fre -fno-tree-coalesce-vars  4m45s
+#   clang -O1  8m44s   (worse than gcc at this size)
+#   gcc -Os    8m34s
+# At 48 part files in the cosim binary, only -O0 (and marginally -Og)
+# fit the 5-minute clean-rebuild budget.  The per-cycle slowdown vs
+# -O0 wasn't measured for -Og since the compile budget is tight.
+# Override with `make ... GATES_OPT=-Og` for a long-running build
+# where you don't mind a 10 min clean compile.
+GATES_OPT       ?= -O0
+CFLAGS_GATES    := -std=c99 -Wall -Wextra $(GATES_OPT) -DPRESI_HAVE_NETLIST \
                    -I$(BUILD) -I.
 
 # Per-part and var.c objects are compiled in parallel via `make -j`.

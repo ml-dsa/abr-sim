@@ -452,10 +452,28 @@ Priorities, in rough order:
        **Run cost:** ~1m17s wall for 384 cycles total (64+64 reset +
        256 poll) -- about 5 cyc/s.  Cost comes from stepping 3
        netlists x 2 phases per logical cycle vs. the original 1
-       netlist x 2 phases.  Acceptable for short bring-up; for full
-       keygen (tens of thousands of cycles) we'll need either -O1
-       compile of the part .c, fewer parts per netlist (less
-       function-call overhead), or simply patience.
+       netlist x 2 phases.
+
+       **Speedups added (in source, awaiting next build):**
+       - `presi_engines_step()` early-returns when abr_wrap's
+         top-level `busy_o == 0`, skipping both engine glues during
+         reset (128 cy) and any post-completion idle.
+       - Per-engine *internal* gates inside each `<engine>_step_glue`:
+         skip the input copy + step + output copy when no gating
+         signal is asserted.  Wired via new `gen_engine_glue.py
+         --gate-on-port` flag (Makefile passes `ntt_enable` +
+         `ntt_busy` for ntt_top, `sampler_start_i` + `sampler_busy_o`
+         + `sha3_start_i` + `msg_valid_i` for abr_sampler_top).
+         During keygen, the controller engages exactly one engine at
+         a time, so each engine's gate misses ~half the active
+         cycles -- net ~25 % wall-time savings on top of the busy_o
+         gate.
+
+       **Compile-time speedup investigation (gcc and clang -O1 both
+       blow far past the 5-min budget at >5 min per part .c):** see
+       `~/.claude/.../presi_build_env.md` for the full table.  -Og
+       is the only middle-ground (48 s/file, ~10 min full build);
+       added a `GATES_OPT ?= -O0` knob with a comment table.
 
    3e. **Drive Dilithium keygen.**  With 3a-3d in place, write
        `seed_in.dat` / `rnd_in.dat` test vectors via the existing
