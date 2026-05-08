@@ -23,6 +23,13 @@
 #include "abr_wrap.seq_rom.h"
 #endif
 
+#ifdef PRESI_HAVE_ENGINE_NETLISTS
+/* Engine var headers expose `<prefix>presi_clk_prev` so presi_cycle
+ * can reset them between phases. */
+#include "ntt_top.presi_var.h"
+#include "abr_sampler_top.presi_var.h"
+#endif
+
 /* ============================================================
  * Bit-vector helpers
  * ============================================================ */
@@ -83,29 +90,58 @@ unsigned presi_read_bits(const int *bits, int n)
  * Netlist step + per-engine glues + SRAM tick
  * ============================================================ */
 
-static void presi_step_netlist(void)
+/*
+ * Each step_netlist call is split by **kind**:
+ *
+ *   _comb : pure combinational pass; runs every step_netlist phase
+ *           (falling-edge, rising-edge, settle) since comb wires
+ *           always need re-evaluation.  Does NOT touch clk_prev.
+ *
+ *   _flop : pure flop tick (DFF/DFFSR), gated by `_edge =
+ *           clk & ~clk_prev` inside the chunk.  Runs only on the
+ *           rising-edge phase; on every other phase _edge would be
+ *           0 and the cells degenerate to Q := Q, so skipping the
+ *           call entirely saves the otherwise-wasted compute.
+ *
+ * `presi_clk_prev` is updated explicitly by the harness at the end
+ * of each phase, not inside step_netlist itself, because the rising
+ * edge requires `clk_prev=0` at the time _flop runs and we need
+ * exact control over when that becomes 1.
+ */
+static void presi_step_netlist_comb(void)
 {
 #ifdef PRESI_HAVE_NETLIST
-#include "abr_wrap.presi_clk.h"
-    /* Snapshot clk so the next step's rising-edge predicate
-     * `(clk & ~presi_clk_prev)` fires only on a real 0->1 transition. */
-    presi_clk_prev = presi_s[IDX_clk];
+#include "abr_wrap.presi_clk_comb.h"
+#endif
+}
+
+static void presi_step_netlist_flop(void)
+{
+#ifdef PRESI_HAVE_NETLIST
+#include "abr_wrap.presi_clk_flop.h"
 #endif
 }
 
 #if defined(PRESI_HAVE_NETLIST) && defined(PRESI_HAVE_ENGINE_NETLISTS)
-extern void ntt_top_step_glue(void);
-extern void abr_sampler_top_step_glue(void);
+extern void ntt_top_step_glue_comb(void);
+extern void ntt_top_step_glue_flop(void);
+extern void abr_sampler_top_step_glue_comb(void);
+extern void abr_sampler_top_step_glue_flop(void);
 #endif
 
-static void presi_engines_step(void)
+static void presi_engines_step_comb(void)
 {
 #if defined(PRESI_HAVE_NETLIST) && defined(PRESI_HAVE_ENGINE_NETLISTS)
-    /* Always step.  busy_o-gated skipping breaks the engine clk_prev
-     * snapshot on the cycle the controller begins driving sampler
-     * inputs (see the long comment in the historical commit message). */
-    ntt_top_step_glue();
-    abr_sampler_top_step_glue();
+    ntt_top_step_glue_comb();
+    abr_sampler_top_step_glue_comb();
+#endif
+}
+
+static void presi_engines_step_flop(void)
+{
+#if defined(PRESI_HAVE_NETLIST) && defined(PRESI_HAVE_ENGINE_NETLISTS)
+    ntt_top_step_glue_flop();
+    abr_sampler_top_step_glue_flop();
 #endif
 }
 
@@ -208,11 +244,12 @@ static void presi_sram_tick_all(struct presi_model *m)
      * presi_sram_* helper, and writes the read result back over the
      * rdata_o bits.
      *
-     * Ordering: invoked AFTER presi_step_netlist() in presi_cycle so
-     * the SRAM samples its inputs as they appear at the rising edge
-     * and the rdata_o is observed by combinational logic on the NEXT
-     * cycle -- matching the synchronous one-cycle read latency of
-     * abr_1r1w_ram / abr_1r1w_be_ram.
+     * Ordering: invoked AFTER the rising-edge step (_flop) and the
+     * settle pass in presi_cycle, so SRAM samples its inputs as
+     * they appear at the rising edge and the rdata_o is observed
+     * by combinational logic on the NEXT cycle -- matching the
+     * synchronous one-cycle read latency of abr_1r1w_ram /
+     * abr_1r1w_be_ram.
      */
 #include "abr_wrap.presi_bb_wiring.h"
 #endif
@@ -229,22 +266,52 @@ void presi_drive_idle(struct presi_model *m)
 void presi_cycle(struct presi_model *m)
 {
     /*
-     * One logical clock cycle.  spice_to_c.py emits each DFF with the
-     * rising-edge predicate `(clk & ~presi_clk_prev)`, so flops only
-     * tick on a 0->1 clock transition; subsequent step_netlist calls
-     * settle combinational without re-clocking.
+     * One logical clock cycle.  Comb chunks run on every phase; flop
+     * chunks run only on the rising-edge phase (the only time
+     * `_edge = clk & ~clk_prev` is non-zero).
+     *
+     * `presi_clk_prev` (and each engine's `<prefix>presi_clk_prev`)
+     * is updated explicitly between phases so the rising-edge
+     * predicate fires exactly once per cycle.  The engine glue's
+     * _flop function updates the engine clk_prev itself; we update
+     * abr_wrap's clk_prev here.
      */
+#ifdef PRESI_HAVE_NETLIST
+    /* Phase 0: falling edge.  Comb only; no flops would tick. */
     m->p.clk = PRESI_0;
     presi_apply_inputs(m);
-    presi_step_netlist();
-    presi_engines_step();
+    presi_step_netlist_comb();
+    presi_engines_step_comb();
+    presi_clk_prev = PRESI_0;
+# if defined(PRESI_HAVE_ENGINE_NETLISTS)
+    ntt_top__presi_clk_prev = PRESI_0;
+    abr_sampler_top__presi_clk_prev = PRESI_0;
+# endif
 
+    /* Phase 1: rising edge.  Comb settles with clk=1, then flops
+     * tick (their `_edge` reads clk_prev=0 from above), then engines
+     * tick similarly.  After this, clk_prev becomes 1 (engine glue
+     * _flop updates engine clk_prev as a side effect; we update
+     * abr_wrap's here). */
     m->p.clk = PRESI_1;
     presi_apply_inputs(m);
-    presi_step_netlist();
-    presi_engines_step();
+    presi_step_netlist_comb();
+    presi_engines_step_comb();
+    presi_step_netlist_flop();
+    presi_engines_step_flop();
+    presi_clk_prev = PRESI_1;
+
+    /* Settle pass: refresh abr_wrap comb downstream of the engine
+     * output paste from _flop, and let engines re-derive comb from
+     * refreshed abr_wrap inputs.  No flops tick (clk_prev=1=clk). */
+    presi_step_netlist_comb();
+    presi_engines_step_comb();
+
     presi_sram_tick_all(m);
     presi_capture_outputs(m);
+#else
+    (void) m;
+#endif
     m->cycle++;
     m->p.hready_i = m->p.hreadyout_o;
 }
@@ -268,15 +335,13 @@ void presi_settle_after_load(struct presi_model *m)
 {
     /*
      * After loading flop / port / SRAM state from a snapshot, run one
-     * combinational pass to refresh comb wires.  Do not advance the
-     * clock: presi_apply_inputs writes m->p.clk into presi_s, and the
-     * snapshot has already restored presi_clk_prev to that same value,
-     * so the rising-edge predicate `(clk & ~clk_prev)` is 0 and no
-     * flop ticks.
+     * combinational pass to refresh comb wires.  Comb-only: we do not
+     * call _flop (no rising edge to process here -- the snapshot was
+     * taken at a settled clk=1 / clk_prev=1 state).
      */
     presi_apply_inputs(m);
-    presi_step_netlist();
-    presi_engines_step();
+    presi_step_netlist_comb();
+    presi_engines_step_comb();
     presi_capture_outputs(m);
 }
 

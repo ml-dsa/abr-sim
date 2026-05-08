@@ -37,19 +37,84 @@ import os
 NUM_PARTS_DEFAULT = 32
 
 
-# Templates: (cell_name, n_pins) -> lambda(pins_as_c_names) -> C statement.
+# ---------- Emit-time peephole folding ----------
 #
-# write_spice emits ports in the order it iterates `cell->connections()`.
-# When a matching module is in the design (blackbox or library cell),
-# write_spice uses the module's port_id order.  Without one it warns
-# "Guessing order of ports" and falls back to the cell's own connection
-# iteration order, which for simplemap- and dfflegalize-produced cells is
-# the *reverse* of insertion order (output first, then inputs reversed).
+# When Yosys ties a cell input to a constant 0/1, the cell's bitwise
+# output simplifies algebraically.  Folding at emit time turns lines
+# like `Q = PRESI_0 | ((PRESI_0 ^ PRESI_1) & ~R & ...)` into the
+# equivalent shorter `Q = ~R & ...`, which roughly halves the source
+# size of DFFSR-heavy chunks (the common case is S=PRESI_0 with R
+# either PRESI_0 or a real reset signal).
 #
-# The presi flow's `(* blackbox *)` declarations in cmos_cells.v get pruned
-# by `hierarchy -check` before simplemap runs (they have no instantiations
-# at that point), so write_spice always uses the guessed order in practice.
-# These templates therefore match the empirically-verified guessed orders:
+# Inputs are C-expression strings produced by NameMap.ref() or by
+# previous fold steps.  The literals "PRESI_0" / "PRESI_1" are
+# recognized; everything else is treated as a runtime expression and
+# left wrapped in parentheses.
+
+_K0 = "PRESI_0"
+_K1 = "PRESI_1"
+
+
+def _is0(e): return e == _K0
+def _is1(e): return e == _K1
+
+
+def fold_not(a):
+    if _is0(a):
+        return _K1
+    if _is1(a):
+        return _K0
+    return "(%s ^ %s)" % (a, _K1)
+
+
+def fold_and(a, b):
+    if _is0(a) or _is0(b):
+        return _K0
+    if _is1(a):
+        return b
+    if _is1(b):
+        return a
+    return "(%s & %s)" % (a, b)
+
+
+def fold_or(a, b):
+    if _is1(a) or _is1(b):
+        return _K1
+    if _is0(a):
+        return b
+    if _is0(b):
+        return a
+    return "(%s | %s)" % (a, b)
+
+
+def fold_xor(a, b):
+    if _is0(a):
+        return b
+    if _is0(b):
+        return a
+    if _is1(a):
+        return fold_not(b)
+    if _is1(b):
+        return fold_not(a)
+    return "(%s ^ %s)" % (a, b)
+
+
+# Templates: (cell_name, n_pins) -> (output_pin_index, lambda(c_refs) -> C stmt).
+#
+# All cells emit branchless straight-line C: each statement is a single
+# bitwise expression on `presi_t` operands.  presi_t is uint8_t and the
+# whole flow maintains the all-bits-set / all-bits-cleared invariant
+# (PRESI_1 = 0xFF, PRESI_0 = 0x00), so AND/OR/XOR/etc. compose without
+# `& 1` masks and bit 0 of every result is always the logical value.
+#
+# `^ PRESI_1` is preferred over `~x`: bitwise NOT works on uint8_t but
+# `~PRESI_1` is `~(int)0xFF = -256` in C's promoted-int arithmetic,
+# which trips `-Woverflow` warnings when Yosys ties an input to a
+# constant.  XOR with PRESI_1 has the same semantics for our invariant
+# (flips every bit) and never warns.
+#
+# write_spice port order (Yosys "guessed" order = reverse cell-connection
+# iteration; output first, then inputs reversed):
 #
 #   $_NOT_(A,Y)              SPICE (Y, A)
 #   $_AND_/$_OR_/$_NAND_/    SPICE (Y, B, A)         -- symmetric, irrelevant
@@ -58,34 +123,45 @@ NUM_PARTS_DEFAULT = 32
 #   $_ORNOT_(A,B,Y)  = A|~B  SPICE (Y, B, A)
 #   $_MUX_(A,B,S,Y) = S?B:A  SPICE (Y, S, B, A)
 #
-# `__NAME_` is the SPICE form of `$_NAME_` (write_spice replaces the
-# leading `$` with `_`).
-# Each entry: (output_pin_index, lambda(n) -> stmt_string).  The output
-# index is what the topo sort needs to know which net the cell drives;
-# we keep the lambdas verbatim so the emitted C is unchanged.
+# Each entry: (output_pin_index, lambda(n) -> stmt).  The output index
+# tells the topo sort which net is driven.
 COMBINATIONAL = {
     # BUF/NOT/NAND/NOR with the original cmos_cells.v declarations follow
     # input-first order (those modules are not pruned because dfflibmap+abc
     # emit them).  Kept for backward compatibility with the abc-based flow.
     ("BUF",  2):       (1, lambda n: "%s = %s;" % (n[1], n[0])),
-    ("NOT",  2):       (1, lambda n: "%s = ~%s;" % (n[1], n[0])),
-    ("NAND", 3):       (2, lambda n: "%s = ~(%s & %s);" % (n[2], n[0], n[1])),
-    ("NOR",  3):       (2, lambda n: "%s = ~(%s | %s);" % (n[2], n[0], n[1])),
+    ("NOT",  2):       (1, lambda n: "%s = %s;" % (n[1], fold_not(n[0]))),
+    ("NAND", 3):       (2, lambda n: "%s = %s;" %
+                                     (n[2], fold_not(fold_and(n[0], n[1])))),
+    ("NOR",  3):       (2, lambda n: "%s = %s;" %
+                                     (n[2], fold_not(fold_or(n[0], n[1])))),
     # Yosys gate primitives.  Output first, then inputs in reverse insertion
     # order.  For symmetric operators the input order is irrelevant.
-    ("__NOT_",     2): (0, lambda n: "%s = ~%s;" % (n[0], n[1])),
-    ("__AND_",     3): (0, lambda n: "%s = %s & %s;" % (n[0], n[2], n[1])),
-    ("__OR_",      3): (0, lambda n: "%s = %s | %s;" % (n[0], n[2], n[1])),
-    ("__NAND_",    3): (0, lambda n: "%s = ~(%s & %s);" % (n[0], n[2], n[1])),
-    ("__NOR_",     3): (0, lambda n: "%s = ~(%s | %s);" % (n[0], n[2], n[1])),
-    ("__XOR_",     3): (0, lambda n: "%s = %s ^ %s;" % (n[0], n[2], n[1])),
-    ("__XNOR_",    3): (0, lambda n: "%s = ~(%s ^ %s);" % (n[0], n[2], n[1])),
-    # SPICE (Y, B, A) maps to Y = A & ~B / Y = A | ~B.
-    ("__ANDNOT_",  3): (0, lambda n: "%s = %s & ~%s;" % (n[0], n[2], n[1])),
-    ("__ORNOT_",   3): (0, lambda n: "%s = %s | ~%s;" % (n[0], n[2], n[1])),
-    # SPICE (Y, S, B, A): Y = S ? B : A.
-    ("__MUX_",     4): (0, lambda n:
-        "%s = (%s & 1) ? %s : %s;" % (n[0], n[1], n[2], n[3])),
+    ("__NOT_",     2): (0, lambda n: "%s = %s;" % (n[0], fold_not(n[1]))),
+    ("__AND_",     3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_and(n[2], n[1]))),
+    ("__OR_",      3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_or(n[2], n[1]))),
+    ("__NAND_",    3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_not(fold_and(n[2], n[1])))),
+    ("__NOR_",     3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_not(fold_or(n[2], n[1])))),
+    ("__XOR_",     3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_xor(n[2], n[1]))),
+    ("__XNOR_",    3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_not(fold_xor(n[2], n[1])))),
+    # SPICE (Y, B, A) maps to Y = A & ~B / Y = A | ~B (B is the inverted leg).
+    ("__ANDNOT_",  3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_and(n[2], fold_not(n[1])))),
+    ("__ORNOT_",   3): (0, lambda n: "%s = %s;" %
+                                     (n[0], fold_or(n[2], fold_not(n[1])))),
+    # Branchless mux: Y = (S & B) | (~S & A).  Folded so that a
+    # constant select collapses to one branch's expression.
+    ("__MUX_",     4): (0, lambda n: "%s = %s;" %
+                                     (n[0],
+                                      fold_or(fold_and(n[1], n[2]),
+                                              fold_and(fold_not(n[1]),
+                                                       n[3])))),
 }
 
 
@@ -187,22 +263,30 @@ def parse_instance(line):
 
 
 def emit_dff(kind, names, pins, flops, clk_prev):
-    """Sequential cell handlers.
+    """Branchless edge-triggered D flip-flop.
 
-    For "DFF" (the original library), SPICE order is (C, D, Q) per the
-    cmos_cells.v declaration.  For "__DFF_P_" (Yosys $_DFF_P_), simplemap
-    sets ports in (D, C, Q) order, so the guessed write_spice order is the
-    reverse (Q, C, D).
+    SPICE port order:
+      "DFF"        (C, D, Q)
+      "__DFF_P_"   (Q, C, D)  -- simplemap output, reverse of insertion
 
-    Edge-triggered semantics: the harness owns a `presi_clk_prev` flag
-    that mirrors the clock value from the *previous* presi_step_netlist
-    call.  We capture D->Q only on a 0->1 transition (`!clk_prev & clk`),
-    so multiple step_netlist calls within one logical cycle settle
-    combinational without re-clocking the flop.
+    Semantics:
+      edge = clk & ~clk_prev   (1 on rising edge, 0 otherwise)
+      Q    = (edge & D) | (~edge & Q)
 
-    Returns a metadata dict (lhs, rhs, stmt, is_flop) so the
-    translator can topologically sort comb statements without disturbing
-    flop ordering.
+    NOT is expressed as `^ PRESI_1` to keep the all-bits invariant
+    intact under integer promotion (and to dodge -Woverflow).  No
+    conditional branch: each emitted statement is a single bitwise
+    expression on `presi_t` operands.  gcc -O0 lowers it to a few
+    AND/OR/XOR machine instructions per flop with no jumps.
+
+    The harness keeps `<prefix>presi_clk_prev` mirroring the clock
+    value from the previous presi_step_netlist call; multiple settle
+    passes within one logical cycle leave the flop unchanged because
+    `clk & ~clk_prev` is 0 outside the rising edge.
+
+    Returns a metadata dict (lhs, rhs, stmt, is_flop) so the topo
+    sort over comb cells can ignore flops (flop outputs are stable
+    during a comb pass).
     """
     if kind == "DFF":
         clk, d, q = pins
@@ -211,26 +295,36 @@ def emit_dff(kind, names, pins, flops, clk_prev):
     qref = names.ref(q)
     dref = names.ref(d)
     cref = names.ref(clk)
-    edge = "(%s & ~%s & 1)" % (cref, clk_prev)
-    stmt = "if %s %s = %s;" % (edge, qref, dref)
+    # Per-flop body references the chunk-local `_edge` (declared once at
+    # the top of every chunk that contains flops; see write_part_files).
+    # All flops in a netlist share the same clk pin and clk_prev global,
+    # so hoisting the `clk & ~clk_prev` mask out of every line cuts the
+    # source size ~2x for DFFSR-heavy chunks.
+    body = fold_or(fold_and("_edge", dref),
+                   fold_and(fold_not("_edge"), qref))
+    stmt = "%s = %s;" % (qref, body)
     flops.add(qref)
     return {"stmt": stmt, "lhs": qref, "rhs": [cref, dref], "is_flop": True}
 
 
 def emit_dffsr(kind, names, pins, flops, clk_prev):
-    """$_DFFSR_PPP_: active-high S/R, rising-edge D->Q.
+    """Branchless DFFSR: active-high level-sensitive S/R, rising-edge D->Q.
 
-    SPICE order for the original "DFFSR" library cell is (C, D, Q, S, R)
-    per its cmos_cells.v declaration.  For "__DFFSR_PPP_" (Yosys
-    $_DFFSR_PPP_), dfflegalize inserts ports in (C, S, R, D, Q) order, so
-    the guessed write_spice order is the reverse (Q, D, R, S, C).
+    SPICE port order:
+      "DFFSR"        (C, D, Q, S, R)
+      "__DFFSR_PPP_" (Q, D, R, S, C)  -- dfflegalize output reversed
 
-    Set/reset are level-sensitive (PPP = pos/pos/pos), so they apply
-    regardless of clock.  Only the D->Q transfer is edge-triggered.
-    We treat DFFSR as a flop for topo-sort purposes (Q is "stable
-    during comb"); the level-sensitive S/R override is handled by
-    emitting the DFFSR statement at the end of the cycle, so any
-    comb that reads Q sees the previous cycle's settled value.
+    Semantics (S beats R beats edge transfer, matching the active-high
+    PPP cell):
+      edge = clk & ~clk_prev
+      Q    = S | (~S & ~R & ((edge & D) | (~edge & Q)))
+
+    Single bitwise expression per cell, no branches.  When the user's
+    Yosys flow ties S or R to PRESI_0 (the common "set unused" / "reset
+    unused" case), the corresponding mask `(PRESI_0 ^ PRESI_1) = PRESI_1`
+    is computed at runtime; gcc could fold it at -O1+ but we accept
+    the small runtime cost in exchange for a uniform emit shape.
+    Treated as a flop for topo-sort purposes.
     """
     if kind == "DFFSR":
         clk, d, q, s, r = pins
@@ -241,11 +335,16 @@ def emit_dffsr(kind, names, pins, flops, clk_prev):
     rref = names.ref(r)
     dref = names.ref(d)
     cref = names.ref(clk)
+    # See emit_dff for the `_edge` rationale: the rising-edge mask is
+    # the same for every flop in a chunk, so we declare it once per
+    # chunk in write_part_files and just reference it here.
+    transfer = fold_or(fold_and("_edge", dref),
+                       fold_and(fold_not("_edge"), qref))
+    body = fold_or(sref,
+                   fold_and(fold_not(sref),
+                            fold_and(fold_not(rref), transfer)))
+    stmt = "%s = %s;" % (qref, body)
     flops.add(qref)
-    edge = "(%s & ~%s & 1)" % (cref, clk_prev)
-    stmt = ("if (%s & 1) %s = PRESI_1; else if (%s & 1) %s = PRESI_0; "
-            "else if %s %s = %s;" %
-            (sref, qref, rref, qref, edge, qref, dref))
     return {"stmt": stmt, "lhs": qref,
             "rhs": [sref, rref, cref, dref], "is_flop": True}
 
@@ -316,82 +415,174 @@ def write_idx_header(path, top, name_map, prefix):
 
 
 def write_part_files(parts_dir, top, header_basename, statements, num_parts,
-                     step_fn_prefix, chunk_size, array_name):
-    """Each part .c becomes:
+                     step_fn_prefix, chunk_size, array_name, manifest_path,
+                     symbol_prefix, clk_pin_idx, clk_prev):
+    """Per-part code emission with comb/flop kind separation.
 
-        static void chunk_<MMM>(presi_t *s) { /* ~chunk_size stmts */ }
-        ...
-        void <prefix>presi_step_part_<NNN>(presi_t *s) {
-            chunk_000(s); chunk_001(s); ... ;
-        }
+    Each part's slice of the topo-sorted statement list is split into
+    two **kinds** by the `is_flop` flag (already correctly grouped:
+    topo_order_comb output first, flop_items last):
 
-    Slicing the topo-sorted statement list into chunks lets gcc see
-    small basic blocks (~chunk_size stmts each) instead of one huge
-    BB.  Per-BB algorithms (var-tracking, liveness, RTL DAG build,
-    register allocation) all scale with BB size; a 340 k-stmt single
-    BB is what makes a single TU take minutes to compile at -O0.
-    Topo correctness is preserved trivially -- the linear order is
-    just sliced into contiguous pieces; each chunk runs to completion
-    before the next, so producer-before-consumer is intact.
+    * **comb chunks** -- `<top>.presi_clk_part_NNN_comb_MMM.c`
+      Pure combinational evaluation; no `_edge`, no clk_prev read.
+      Called on every step_netlist phase (falling-edge, rising-edge,
+      and settle) since comb wires must always be re-evaluated.
 
-    `chunk_size <= 0` disables chunking (one body, useful for debug
-    or when the part is small enough to fit a single function).
+    * **flop chunks** -- `<top>.presi_clk_part_NNN_flop_MMM.c`
+      Pure flop tick statements (DFF + DFFSR).  Each chunk declares a
+      local `_edge = s[clk] & (clk_prev ^ PRESI_1)` once at the top
+      and every cell body uses it.  Called only on the rising-edge
+      phase; on falling-edge / settle, `_edge` would be 0 and the
+      ticks degenerate to no-ops, so skipping the call entirely
+      saves the otherwise-wasted compute.
+
+    Each part also emits a small dispatcher file
+    (`<top>.presi_clk_part_NNN.c`) with two public functions:
+      `<prefix>presi_step_part_NNN_comb(presi_t *s)`
+      `<prefix>presi_step_part_NNN_flop(presi_t *s)`
+    that call the comb / flop chunks of that part in order.  If a
+    part has no flops the flop dispatcher is still emitted but with
+    an empty body, so the harness can call it unconditionally without
+    a per-part check.
+
+    `manifest_path` receives a Make snippet listing every emitted .c
+    basename in `<TOP>_CHUNK_C`; presi/Makefile -includes it so the
+    build system can list every .o without knowing the chunk counts
+    a priori.
+
+    Why one TU per chunk: gcc parses, types, and codegens an entire
+    .c file as one unit, so a 42 MB monolith dominates wall time
+    even with -O0.  Per-chunk TUs let `make -j` parallelize the
+    compile and keep each chunk's symbol table small enough that
+    -O1 is also tractable.
     """
     n = len(statements)
     if n == 0:
         per_part = 0
     else:
         per_part = (n + num_parts - 1) // num_parts
+
+    emitted = []  # basenames of every .c file we wrote (for the manifest)
+
+    def emit_chunks(kind, slice_lo, slice_hi, idx):
+        """Emit one .c file per chunk_size slice of `kind` ('comb' or
+        'flop').  Returns the list of (basename, func_name) tuples
+        that the dispatcher will reference.  `kind` controls whether
+        the body needs the `_edge` local (only flops do)."""
+        chunk_funcs = []
+        n_kind = slice_hi - slice_lo
+        if n_kind == 0:
+            return chunk_funcs
+        if chunk_size > 0:
+            n_chunks = (n_kind + chunk_size - 1) // chunk_size
+        else:
+            n_chunks = 1
+        for c in range(n_chunks):
+            cstart = slice_lo + c * chunk_size if chunk_size > 0 else slice_lo
+            cend = min(cstart + chunk_size, slice_hi) if chunk_size > 0 else slice_hi
+            chunk_basename = ("%s.presi_clk_part_%03d_%s_%03d.c" %
+                              (top, idx, kind, c))
+            chunk_path = os.path.join(parts_dir, chunk_basename)
+            func_name = ("%schunk_%03d_%s_%03d" %
+                         (symbol_prefix, idx, kind, c))
+            with open(chunk_path, "w", encoding="utf-8") as f:
+                f.write("/* Generated by spice_to_c.py.  Do not edit. */\n")
+                f.write('#include "%s"\n' % header_basename)
+                f.write("\nvoid %s(presi_t *s)\n{\n" % func_name)
+                if kind == "flop":
+                    f.write("\tpresi_t _edge = s[%d] & (%s ^ PRESI_1);\n" %
+                            (clk_pin_idx, clk_prev))
+                for i in range(cstart, cend):
+                    f.write("\t%s\n" % statements[i][0])
+                f.write("}\n")
+            emitted.append(chunk_basename)
+            chunk_funcs.append((chunk_basename, func_name))
+        return chunk_funcs
+
     for idx in range(num_parts):
         start = idx * per_part
         end = min(start + per_part, n) if per_part else 0
-        path = os.path.join(parts_dir,
-                            "%s.presi_clk_part_%03d.c" % (top, idx))
-        with open(path, "w", encoding="utf-8") as f:
+
+        # Split the part's slice into comb/flop runs.  Topo order
+        # already groups comb_ordered first then flop_items, so the
+        # `is_flop` flag transitions at most once per part; the split
+        # point is the first flop entry (if any).
+        comb_lo = start
+        comb_hi = start
+        for i in range(start, end):
+            if statements[i][1]:  # is_flop
+                break
+            comb_hi = i + 1
+        flop_lo = comb_hi
+        flop_hi = end
+        # Sanity: there should be no comb stmt after a flop stmt within
+        # a single part.
+        for i in range(flop_lo, flop_hi):
+            if not statements[i][1]:
+                raise SystemExit("comb stmt after flop stmt in part %d "
+                                 "(topo order broken)" % idx)
+
+        dispatcher_basename = "%s.presi_clk_part_%03d.c" % (top, idx)
+        dispatcher_path = os.path.join(parts_dir, dispatcher_basename)
+
+        comb_funcs = emit_chunks("comb", comb_lo, comb_hi, idx)
+        flop_funcs = emit_chunks("flop", flop_lo, flop_hi, idx)
+
+        with open(dispatcher_path, "w", encoding="utf-8") as f:
             f.write("/* Generated by spice_to_c.py.  Do not edit. */\n")
             f.write('#include "%s"\n' % header_basename)
-            n_part = end - start
-            if chunk_size > 0 and n_part > chunk_size:
-                # Multi-chunk part: emit static helpers + a public dispatch
-                # that calls them in order.
-                num_chunks = (n_part + chunk_size - 1) // chunk_size
-                for c in range(num_chunks):
-                    cstart = start + c * chunk_size
-                    cend = min(cstart + chunk_size, end)
-                    f.write("\nstatic void chunk_%03d(presi_t *s)\n{\n" % c)
-                    for i in range(cstart, cend):
-                        f.write("\t%s\n" % statements[i])
-                    f.write("}\n")
-                f.write("\nvoid %spresi_step_part_%03d(presi_t *s)\n{\n" %
-                        (step_fn_prefix, idx))
-                for c in range(num_chunks):
-                    f.write("\tchunk_%03d(s);\n" % c)
-                f.write("}\n")
-            else:
-                f.write("void %spresi_step_part_%03d(presi_t *s)\n{\n" %
-                        (step_fn_prefix, idx))
-                for i in range(start, end):
-                    f.write("\t%s\n" % statements[i])
-                f.write("}\n")
+            for _bn, fn in comb_funcs + flop_funcs:
+                f.write("extern void %s(presi_t *);\n" % fn)
+            # Always emit both step_part_NNN_{comb,flop}, even when
+            # one is empty -- the harness calls them unconditionally
+            # and the empty-body inline cost at -O0 is one ret.
+            f.write("\nvoid %spresi_step_part_%03d_comb(presi_t *s)\n{\n" %
+                    (step_fn_prefix, idx))
+            if not comb_funcs:
+                f.write("\t(void) s;\n")
+            for _bn, fn in comb_funcs:
+                f.write("\t%s(s);\n" % fn)
+            f.write("}\n")
+            f.write("\nvoid %spresi_step_part_%03d_flop(presi_t *s)\n{\n" %
+                    (step_fn_prefix, idx))
+            if not flop_funcs:
+                f.write("\t(void) s;\n")
+            for _bn, fn in flop_funcs:
+                f.write("\t%s(s);\n" % fn)
+            f.write("}\n")
+        emitted.append(dispatcher_basename)
+
+    # Manifest: a Make snippet `-include`d by presi/Makefile.  The
+    # variable name is uppercased <TOP>_CHUNK_C; values are basenames
+    # only (Makefile prepends $(BUILD)/).
+    var_name = "%s_CHUNK_C" % top.upper()
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        f.write("# Generated by spice_to_c.py.  Do not edit.\n")
+        f.write("%s := %s\n" % (var_name, " ".join(emitted)))
 
 
-def write_clk_dispatch(path, num_parts, step_fn_prefix, array_name):
-    """Generated dispatcher header.  Each step_part_NNN is now
-    `void f(presi_t *s)`; the dispatcher passes the netlist's
-    `<prefix>presi_s` array pointer.  Included from inside the
-    harness's `presi_step_netlist()` (or per-engine glue's body)."""
+def write_clk_dispatch(path, num_parts, step_fn_prefix, array_name, kind):
+    """Generated dispatcher header for one phase kind ("comb" or
+    "flop").  Each part has two public step functions; this header
+    emits the externs + call sequence for the requested kind.
+
+    Included from inside `presi_step_netlist_comb()` /
+    `presi_step_netlist_flop()` (or the per-engine glue's matching
+    function).  Block-scope extern decls are legal C99 and stay
+    local to that function.
+
+    The flop header is still emitted for netlists that have no
+    flops (the per-part dispatcher's flop body is just empty), so
+    the harness can call either flavor unconditionally.
+    """
     with open(path, "w", encoding="utf-8") as f:
-        f.write("/* Generated by spice_to_c.py.  Do not edit.\n"
-                " *\n"
-                " * Included from the harness step function.  The block-scope\n"
-                " * extern declarations are legal C99 and stay local to that\n"
-                " * function. */\n")
+        f.write("/* Generated by spice_to_c.py.  Do not edit. */\n")
         for i in range(num_parts):
-            f.write("extern void %spresi_step_part_%03d(presi_t *);\n" %
-                    (step_fn_prefix, i))
+            f.write("extern void %spresi_step_part_%03d_%s(presi_t *);\n" %
+                    (step_fn_prefix, i, kind))
         for i in range(num_parts):
-            f.write("%spresi_step_part_%03d(%s);\n" %
-                    (step_fn_prefix, i, array_name))
+            f.write("%spresi_step_part_%03d_%s(%s);\n" %
+                    (step_fn_prefix, i, kind, array_name))
 
 
 def topo_order_comb(items, flop_outputs):
@@ -449,8 +640,8 @@ def topo_order_comb(items, flop_outputs):
     return [items[i] for i in order]
 
 
-def translate(spice_file, var_header, var_c, clk_dispatch, parts_dir,
-              num_parts, map_file, bb_file, top, symbol_prefix="",
+def translate(spice_file, var_header, var_c, clk_comb, clk_flop, parts_dir,
+              num_parts, map_file, bb_file, top, manifest, symbol_prefix="",
               chunk_size=8192):
     names = NameMap(prefix=symbol_prefix)
     clk_prev = symbol_prefix + "presi_clk_prev"
@@ -551,11 +742,26 @@ def translate(spice_file, var_header, var_c, clk_dispatch, parts_dir,
     comb = [it for it in items if not it["is_flop"]]
     flop_items = [it for it in items if it["is_flop"]]
     comb_ordered = topo_order_comb(comb, flops)
-    statements = [it["stmt"] for it in comb_ordered] + \
-                 [it["stmt"] for it in flop_items]
+    ordered = list(comb_ordered) + list(flop_items)
+    # Pass (stmt, is_flop) tuples through to the chunk emitter so it can
+    # decide whether a chunk needs a `_edge` local at its top.
+    statements = [(it["stmt"], it["is_flop"]) for it in ordered]
 
     num_nets = len(names.order)
     header_basename = os.path.basename(var_header)
+
+    # The flop emit references a chunk-local `_edge` computed from the
+    # netlist's clk pin and clk_prev global.  Resolve the clk pin's
+    # index once here so the chunk emitter can bake a literal `s[<N>]`
+    # into the declaration.  Netlists without flops never declare _edge.
+    clk_pin_idx = None
+    if flop_items:
+        spice_clk = "clk"
+        if spice_clk not in names.names:
+            raise SystemExit("emit_dff/emit_dffsr: no `clk` net in "
+                             "namemap for %s; rename or extend the "
+                             "lookup" % top)
+        clk_pin_idx = names.names[spice_clk]
 
     write_var_header(var_header, top, num_nets, symbol_prefix, clk_prev)
     write_var_definitions(var_c, header_basename, num_nets,
@@ -563,8 +769,10 @@ def translate(spice_file, var_header, var_c, clk_dispatch, parts_dir,
     os.makedirs(parts_dir, exist_ok=True)
     array_name = symbol_prefix + "presi_s"
     write_part_files(parts_dir, top, header_basename, statements, num_parts,
-                     step_fn_prefix, chunk_size, array_name)
-    write_clk_dispatch(clk_dispatch, num_parts, step_fn_prefix, array_name)
+                     step_fn_prefix, chunk_size, array_name, manifest,
+                     symbol_prefix, clk_pin_idx, clk_prev)
+    write_clk_dispatch(clk_comb, num_parts, step_fn_prefix, array_name, "comb")
+    write_clk_dispatch(clk_flop, num_parts, step_fn_prefix, array_name, "flop")
 
     # The index header lives next to the var header; consumers
     # (presi.c, gen_engine_glue.py output) include it to look up
@@ -607,8 +815,12 @@ def main():
                     help="header with extern presi_t declarations")
     ap.add_argument("--vars-c", required=True,
                     help="C file with presi_t definitions")
-    ap.add_argument("--clock", required=True,
-                    help="dispatch header (extern decls + calls)")
+    ap.add_argument("--clock-comb", required=True,
+                    help="dispatch header for the comb phase "
+                         "(extern decls + calls of step_part_NNN_comb)")
+    ap.add_argument("--clock-flop", required=True,
+                    help="dispatch header for the flop (rising edge) "
+                         "phase (extern decls + calls of step_part_NNN_flop)")
     ap.add_argument("--parts-dir", required=True,
                     help="directory for per-part C files")
     ap.add_argument("--num-parts", type=int, default=NUM_PARTS_DEFAULT,
@@ -624,15 +836,22 @@ def main():
                          "use to compile multiple netlists into one binary "
                          "without symbol collisions")
     ap.add_argument("--chunk-size", type=int, default=8192,
-                    help="split each part body into static helper "
-                         "functions of this many statements each, called "
-                         "in topo order from the public step_part_NNN "
-                         "function.  0 disables chunking (one body)")
+                    help="split each part body into helper functions "
+                         "of this many statements each, each in its "
+                         "own .c file (one TU per chunk so make -j "
+                         "parallelizes them).  0 disables chunking "
+                         "(one body inline in the part .c).")
+    ap.add_argument("--manifest", required=True,
+                    help="path of the Make snippet listing every "
+                         "emitted .c basename; -include'd by the "
+                         "Makefile so it can list the chunk .o "
+                         "targets without knowing the count a priori.")
     args = ap.parse_args()
     if args.num_parts < 1:
         raise SystemExit("--num-parts must be >= 1")
-    translate(args.spice, args.vars, args.vars_c, args.clock, args.parts_dir,
-              args.num_parts, args.map, args.bb, args.top,
+    translate(args.spice, args.vars, args.vars_c, args.clock_comb,
+              args.clock_flop, args.parts_dir, args.num_parts, args.map,
+              args.bb, args.top, args.manifest,
               symbol_prefix=args.symbol_prefix,
               chunk_size=args.chunk_size)
 

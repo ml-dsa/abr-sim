@@ -244,13 +244,21 @@ static int load_snapshot(struct presi_model *m, const char *fn)
     return 0;
 }
 
-static int save_snapshot(const struct presi_model *m, const char *fn)
+static int save_snapshot(struct presi_model *m, const char *fn)
 {
     FILE *fp = fopen(fn, "wb");
     if (fp == NULL) {
         perror(fn);
         return -1;
     }
+    /* Canonicalize before write so save -> load -> save round-trips
+     * byte-identically.  presi_cycle's tail leaves abr_wrap comb
+     * downstream of the SRAM rdata_o write-back stale; one settle
+     * pass refreshes that comb (and is empirically a fixed point,
+     * matching what presi_state_load runs after restore). */
+#ifdef PRESI_HAVE_NETLIST
+    presi_settle_after_load(m);
+#endif
     if (presi_state_save(fp, m) != 0) {
         fclose(fp);
         return -1;

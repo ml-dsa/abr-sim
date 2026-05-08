@@ -39,7 +39,8 @@ INVENTORY       := $(BUILD)/$(TOP).inventory.txt
 GATES_VAR_H     := $(BUILD)/$(TOP).presi_var.h
 GATES_VAR_C     := $(BUILD)/$(TOP).presi_var.c
 GATES_IDX_H     := $(BUILD)/$(TOP).presi_idx.h
-GATES_CLK_H     := $(BUILD)/$(TOP).presi_clk.h
+GATES_CLK_COMB_H:= $(BUILD)/$(TOP).presi_clk_comb.h
+GATES_CLK_FLOP_H:= $(BUILD)/$(TOP).presi_clk_flop.h
 GATES_MAP       := $(BUILD)/$(TOP).presi_map.csv
 GATES_BB        := $(BUILD)/$(TOP).presi_bb.csv
 GATES_BB_WIRING := $(BUILD)/$(TOP).presi_bb_wiring.h
@@ -60,6 +61,23 @@ CHUNK_SIZE      ?= 8192
 GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(GATE_C_PARTS))))")
 GATES_PART_C    := $(foreach i,$(GATE_PART_IDX),$(BUILD)/$(TOP).presi_clk_part_$(i).c)
 GATES_PART_O    := $(GATES_PART_C:.c=.o)
+# Chunk .c files: count is data-dependent (varies per part because
+# ceil(stmts_per_part / CHUNK_SIZE) varies), so spice_to_c.py emits a
+# Make snippet listing every basename.  We `-include` it after the
+# stamp runs; on the first build the rule below makes Make refresh
+# itself once the snippet appears.  The variable is named after the
+# upper-cased top: $(TOP).chunks.mk -> ABR_WRAP_CHUNK_C.
+GATES_CHUNKS_MK := $(BUILD)/$(TOP).chunks.mk
+# `make clean` (or any *clean target) must not trigger the auto-rebuild
+# behaviour of GNU Make's `-include`: that would run Yosys + spice_to_c.py
+# to regenerate chunks.mk just so we can delete it moments later.  Skip
+# the include and the auto-update rule when the goal is a clean.
+ifeq (,$(filter clean %clean,$(MAKECMDGOALS)))
+-include $(GATES_CHUNKS_MK)
+$(GATES_CHUNKS_MK): $(GATES_STAMP) ;
+endif
+GATES_CHUNK_C   := $(addprefix $(BUILD)/,$(ABR_WRAP_CHUNK_C))
+GATES_CHUNK_O   := $(GATES_CHUNK_C:.c=.o)
 GATES_VAR_O     := $(GATES_VAR_C:.c=.o)
 PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
@@ -125,13 +143,15 @@ $(GATES_STAMP): $(GATES_SPICE) $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(GATES_SPICE) \
 		--top $(TOP) --num-parts $(GATE_C_PARTS) \
 		--chunk-size $(CHUNK_SIZE) \
+		--manifest $(GATES_CHUNKS_MK) \
 		--vars $(GATES_VAR_H) --vars-c $(GATES_VAR_C) \
-		--clock $(GATES_CLK_H) --parts-dir $(BUILD) \
+		--clock-comb $(GATES_CLK_COMB_H) \
+		--clock-flop $(GATES_CLK_FLOP_H) --parts-dir $(BUILD) \
 		--map $(GATES_MAP) --bb $(GATES_BB)
 	@touch $@
 
 # All gate-c outputs are produced atomically by the stamp recipe above.
-$(GATES_VAR_H) $(GATES_VAR_C) $(GATES_IDX_H) $(GATES_CLK_H) $(GATES_MAP) $(GATES_BB) $(GATES_PART_C): $(GATES_STAMP)
+$(GATES_VAR_H) $(GATES_VAR_C) $(GATES_IDX_H) $(GATES_CLK_COMB_H) $(GATES_CLK_FLOP_H) $(GATES_MAP) $(GATES_BB) $(GATES_PART_C) $(GATES_CHUNK_C): $(GATES_STAMP)
 	@:
 
 # Blackbox wiring header: turns presi_bb.csv pin lists into the body of
@@ -190,6 +210,13 @@ $(SEQ_ROM_H) $(SEQ_ROM_JSON): $(ABR_SEQ_JSON) $(FLOW)/extract_seq_rom.py
 NTT_GATE_C_PARTS    ?= 8
 NTT_GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(NTT_GATE_C_PARTS))))")
 NTT_PART_C          := $(foreach i,$(NTT_GATE_PART_IDX),$(BUILD)/ntt_top.presi_clk_part_$(i).c)
+NTT_CHUNKS_MK       := $(BUILD)/ntt_top.chunks.mk
+ifeq (,$(filter clean %clean,$(MAKECMDGOALS)))
+-include $(NTT_CHUNKS_MK)
+$(NTT_CHUNKS_MK): $(BUILD)/ntt_top.gate-c.stamp ;
+endif
+NTT_CHUNK_C         := $(addprefix $(BUILD)/,$(NTT_TOP_CHUNK_C))
+NTT_CHUNK_O         := $(NTT_CHUNK_C:.c=.o)
 
 ntt-top: $(BUILD)/ntt_top.gate-c.stamp
 
@@ -210,10 +237,13 @@ $(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/ntt_top.gates.sp \
 		--top ntt_top --num-parts $(NTT_GATE_C_PARTS) \
 		--chunk-size $(CHUNK_SIZE) \
+		--manifest $(NTT_CHUNKS_MK) \
 		--symbol-prefix 'ntt_top__' \
 		--vars $(BUILD)/ntt_top.presi_var.h \
 		--vars-c $(BUILD)/ntt_top.presi_var.c \
-		--clock $(BUILD)/ntt_top.presi_clk.h --parts-dir $(BUILD) \
+		--clock-comb $(BUILD)/ntt_top.presi_clk_comb.h \
+		--clock-flop $(BUILD)/ntt_top.presi_clk_flop.h \
+		--parts-dir $(BUILD) \
 		--map $(BUILD)/ntt_top.presi_map.csv \
 		--bb $(BUILD)/ntt_top.presi_bb.csv
 	@touch $@
@@ -221,8 +251,9 @@ $(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
 # All ntt_top gate-c outputs are produced atomically by the stamp.
 $(BUILD)/ntt_top.presi_var.h $(BUILD)/ntt_top.presi_var.c \
 $(BUILD)/ntt_top.presi_idx.h \
-$(BUILD)/ntt_top.presi_clk.h $(BUILD)/ntt_top.presi_map.csv \
-$(BUILD)/ntt_top.presi_bb.csv $(NTT_PART_C): $(BUILD)/ntt_top.gate-c.stamp
+$(BUILD)/ntt_top.presi_clk_comb.h $(BUILD)/ntt_top.presi_clk_flop.h \
+$(BUILD)/ntt_top.presi_map.csv \
+$(BUILD)/ntt_top.presi_bb.csv $(NTT_PART_C) $(NTT_CHUNK_C): $(BUILD)/ntt_top.gate-c.stamp
 	@:
 
 # abr_sampler_top per-engine flow.  Includes the SHA3/Keccak hierarchy
@@ -232,6 +263,13 @@ $(BUILD)/ntt_top.presi_bb.csv $(NTT_PART_C): $(BUILD)/ntt_top.gate-c.stamp
 SAMPLER_GATE_C_PARTS    ?= 8
 SAMPLER_GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(SAMPLER_GATE_C_PARTS))))")
 SAMPLER_PART_C          := $(foreach i,$(SAMPLER_GATE_PART_IDX),$(BUILD)/abr_sampler_top.presi_clk_part_$(i).c)
+SAMPLER_CHUNKS_MK       := $(BUILD)/abr_sampler_top.chunks.mk
+ifeq (,$(filter clean %clean,$(MAKECMDGOALS)))
+-include $(SAMPLER_CHUNKS_MK)
+$(SAMPLER_CHUNKS_MK): $(BUILD)/abr_sampler_top.gate-c.stamp ;
+endif
+SAMPLER_CHUNK_C         := $(addprefix $(BUILD)/,$(ABR_SAMPLER_TOP_CHUNK_C))
+SAMPLER_CHUNK_O         := $(SAMPLER_CHUNK_C:.c=.o)
 
 abr-sampler-top: $(BUILD)/abr_sampler_top.gate-c.stamp
 
@@ -253,10 +291,13 @@ $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_sampler_top.gates.sp \
 		--top abr_sampler_top --num-parts $(SAMPLER_GATE_C_PARTS) \
 		--chunk-size $(CHUNK_SIZE) \
+		--manifest $(SAMPLER_CHUNKS_MK) \
 		--symbol-prefix 'abr_sampler_top__' \
 		--vars $(BUILD)/abr_sampler_top.presi_var.h \
 		--vars-c $(BUILD)/abr_sampler_top.presi_var.c \
-		--clock $(BUILD)/abr_sampler_top.presi_clk.h --parts-dir $(BUILD) \
+		--clock-comb $(BUILD)/abr_sampler_top.presi_clk_comb.h \
+		--clock-flop $(BUILD)/abr_sampler_top.presi_clk_flop.h \
+		--parts-dir $(BUILD) \
 		--map $(BUILD)/abr_sampler_top.presi_map.csv \
 		--bb $(BUILD)/abr_sampler_top.presi_bb.csv
 	@touch $@
@@ -264,8 +305,9 @@ $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)
 # All abr_sampler_top gate-c outputs are produced atomically by the stamp.
 $(BUILD)/abr_sampler_top.presi_var.h $(BUILD)/abr_sampler_top.presi_var.c \
 $(BUILD)/abr_sampler_top.presi_idx.h \
-$(BUILD)/abr_sampler_top.presi_clk.h $(BUILD)/abr_sampler_top.presi_map.csv \
-$(BUILD)/abr_sampler_top.presi_bb.csv $(SAMPLER_PART_C): \
+$(BUILD)/abr_sampler_top.presi_clk_comb.h $(BUILD)/abr_sampler_top.presi_clk_flop.h \
+$(BUILD)/abr_sampler_top.presi_map.csv \
+$(BUILD)/abr_sampler_top.presi_bb.csv $(SAMPLER_PART_C) $(SAMPLER_CHUNK_C): \
 		$(BUILD)/abr_sampler_top.gate-c.stamp
 	@:
 
@@ -301,10 +343,13 @@ $(BUILD)/abr_seq.gate-c.stamp: $(BUILD)/abr_seq.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_seq.gates.sp \
 		--top abr_seq --num-parts $(SEQ_GATE_C_PARTS) \
 		--chunk-size $(CHUNK_SIZE) \
+		--manifest $(BUILD)/abr_seq.chunks.mk \
 		--symbol-prefix 'abr_seq__' \
 		--vars $(BUILD)/abr_seq.presi_var.h \
 		--vars-c $(BUILD)/abr_seq.presi_var.c \
-		--clock $(BUILD)/abr_seq.presi_clk.h --parts-dir $(BUILD) \
+		--clock-comb $(BUILD)/abr_seq.presi_clk_comb.h \
+		--clock-flop $(BUILD)/abr_seq.presi_clk_flop.h \
+		--parts-dir $(BUILD) \
 		--map $(BUILD)/abr_seq.presi_map.csv \
 		--bb $(BUILD)/abr_seq.presi_bb.csv
 	@touch $@
@@ -430,7 +475,8 @@ $(BUILD)/abr_sampler_top.presi_clk_part_%.o: \
 
 PRESI_C_HDR_DEPS    := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H)
 PRESI_GATES_C_HDRS  := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H) \
-                       $(GATES_CLK_H) $(GATES_BB_WIRING) $(SEQ_ROM_H)
+                       $(GATES_CLK_COMB_H) $(GATES_CLK_FLOP_H) \
+                       $(GATES_BB_WIRING) $(SEQ_ROM_H)
 PRESI_STATE_C_HDRS  := presi_state.h presi_model.h $(GATES_VAR_H)
 
 $(BUILD)/presi.gates.o: presi.c $(PRESI_C_HDR_DEPS)
@@ -464,18 +510,18 @@ PRESI_LIB_HARNESS_O     := $(BUILD)/presi_gates.cosim.o \
                            $(BUILD)/presi_state.cosim.o $(BUILD)/presi_sram.o
 
 # ---- presi-gates: no-engines binary (control-plane smoke).
-$(PRESI_GATES): $(PRESI_GATES_HARNESS_O) $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
+$(PRESI_GATES): $(PRESI_GATES_HARNESS_O) $(GATES_VAR_O) $(GATES_PART_O) $(GATES_CHUNK_O) | $(BUILD)
 	gcc $(CFLAGS_GATES) -o $@ $(PRESI_GATES_HARNESS_O) \
-		$(GATES_VAR_O) $(GATES_PART_O)
+		$(GATES_VAR_O) $(GATES_PART_O) $(GATES_CHUNK_O)
 
 # ---- libpresi_gates.a: cosim flavor.  Bundles all gate-netlist .o
 # files plus the cosim-flavor harness .o files (presi_gates / state /
 # sram).  Iterating on presi.c only relinks; nothing in the archive
 # is touched.  Archive size is whatever the constituent .o files
 # total -- ~258 MB for the current build.
-LIB_PRESI_GATES_OBJS    := $(GATES_VAR_O) $(GATES_PART_O) \
-                           $(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
-                           $(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O) \
+LIB_PRESI_GATES_OBJS    := $(GATES_VAR_O) $(GATES_PART_O) $(GATES_CHUNK_O) \
+                           $(NTT_VAR_O) $(NTT_PART_O) $(NTT_CHUNK_O) $(NTT_GLUE_O) \
+                           $(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_CHUNK_O) $(SAMPLER_GLUE_O) \
                            $(PRESI_LIB_HARNESS_O)
 
 $(LIB_PRESI_GATES): $(LIB_PRESI_GATES_OBJS) | $(BUILD)
