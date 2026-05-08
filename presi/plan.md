@@ -335,6 +335,80 @@ the `mldsa-keygen` driver is wired source-side.  Item 7 (running a
 deterministic AB operation end-to-end and comparing against Verilator)
 is the final remaining item; see "Where to pick up next" below.
 
+## Library + snapshot architecture (2026-05-08)
+
+The cosim flow now builds a static archive `_build/libpresi_gates.a`
+that bundles all the gate-netlist .o files (32 abr_wrap + 8 ntt_top
++ 8 abr_sampler_top part files, plus var.o and glue.o per netlist)
+together with the cosim flavor of `presi_gates.o` / `presi_state.o` /
+`presi_sram.o`.  The `presi-cosim` binary links against the archive:
+
+```
+$(LIB_PRESI_GATES) ←  GATES_*.o + NTT_*.o + SAMPLER_*.o + GLUE_*.o
+                    + presi_gates.cosim.o + presi_state.cosim.o
+                    + presi_sram.o            (~258 MB once built)
+
+presi-cosim       ←  presi.cosim.o + libpresi_gates.a
+```
+
+Iterating on the harness CLI (`presi.c`) only triggers one .o
+recompile and a relink (~30 s); the archive stays cached.  `make lib`
+builds just the archive without producing the binary.
+
+### Snapshot save/load
+
+Full simulator state can be checkpointed to / restored from a binary
+file via `presi_state.{c,h}` (in the library):
+
+- bit-packed `presi_s[]` for abr_wrap + each engine
+- per-netlist `presi_clk_prev`
+- `model.p` (AHB port mirror) + `model.cycle`
+- All C-side SRAM contents (raw uint32 arrays)
+- Layout-hash header rejects snapshots built against a different
+  netlist
+
+After `presi_state_load()`, the harness calls
+`presi_settle_after_load()` (one comb-only pass) so any combinational
+wires not captured in the saved state become consistent with the
+loaded flop / port / SRAM state.  See `state-plan.md` for format
+details.
+
+### CLI (mirrors abr_wrap)
+
+`presi-cosim` now uses `src/abr_wrap.cpp`'s flag style:
+
+```
+presi-cosim [options] [operation]
+
+operation := smoke (default), mldsa-keygen / keygen,
+             run, dump-pk, dump-sk
+             (other mldsa-* / mlkem-* names recognised, "not yet
+             wired" message)
+
+options   := -t <n>     max cycles (default 200000)
+             -seed/-ent/-pk/-sk/-sig/-hash/-rnd/-mu/-strm
+             -d/-z/-msg/-ek/-dk/-ct/-ss      (file slots)
+             -vcd <fn>  accepted+ignored (compat)
+             -load <fn> load snapshot before running
+             -save <fn> save snapshot at end
+             -init-only stop after CTRL write (snapshot-friendly)
+             -no-output skip writing pk/sk output files
+```
+
+Examples:
+
+```sh
+# Build a "moment of CTRL=KEYGEN" snapshot:
+./presi-cosim -seed seed_in.dat -ent ent_in.dat \
+              -save kg-init.bin -init-only mldsa-keygen
+
+# Advance a snapshot 1000 cycles:
+./presi-cosim -load kg-init.bin -save kg-1k.bin -t 1000 run
+
+# Dump pk from a finished snapshot:
+./presi-cosim -load kg-done.bin -pk pk_out.dat dump-pk
+```
+
 ## Where to pick up next
 
 The cosim binary co-simulates abr_wrap + ntt_top + abr_sampler_top as
@@ -573,14 +647,54 @@ Priorities, in rough order:
        driving sampler inputs (busy_o lags by 1 cycle), stalling
        the FSM at MLDSA_KG_S forever.  Removed in this same commit.
 
-4. **Stage 5 — first end-to-end Dilithium keygen byte-compare.**
-   `make run-cosim-keygen` is wired source-side (3e above).  Generate
-   inputs (`python3 flow/mldsa-gen.py keygen <message> <xi> <rho'>`),
-   run cosim (~1-3 hour wall at 5 cyc/s), compare `pk_out.dat` /
-   `sk_out.dat` byte-for-byte against `./abr_wrap mldsa-keygen`'s
-   reference output.  Record actual cycle count for documentation.
+4. **Snapshot-driven workflow (5-minute experiments).**
+   `presi_state.{c,h}` lands snapshots; CLI mirrors abr_wrap.
+   Workflow that lets each individual run finish under 5 min wall
+   even though full keygen is multi-hour:
 
-5. **SRAM port-width truncation.**  The naive fix -- defer
+       # Build "moment of CTRL=KEYGEN" snapshot once (fast: ~30 s):
+       ./presi-cosim -seed seed_in.dat -ent ent_in.dat \
+                     -save kg-init.bin -init-only mldsa-keygen
+       # Advance in 5-min chunks (~1500 cy each):
+       ./presi-cosim -load kg-init.bin -save kg-1.bin -t 1500 run
+       ./presi-cosim -load kg-1.bin    -save kg-2.bin -t 1500 run
+       ...
+       # Or compare two snapshots byte-for-byte to confirm round-trip:
+       cmp kg-1.bin kg-1again.bin
+
+   Validate end-to-end byte-compare against Verilator (`./abr_wrap
+   mldsa-keygen`) once a finished snapshot exists.
+
+5. **Python snapshot writer (skip AHB-init step).**  spice_to_c.py
+   exposes `is_flop` per emitted cell; with that we can dump a
+   `<top>.flop_idx.csv` listing just the flop indices, plus a
+   register-map CSV mapping each AHB byte offset to the relevant
+   flop indices.  A Python tool then writes a snapshot for any (op,
+   seed, entropy) tuple instantly without any gate-stepping.
+   `presi_settle_after_load()` already runs a comb pass post-load,
+   so a flop-only snapshot is sufficient.
+
+6. **VCD-driven snapshot for cross-validation.**  Verilator dumps
+   source-level RTL signal names like `top0.abr_ctrl_inst.abr_prog_cntr[3]`;
+   Yosys flatten preserves these as `top0_abr_ctrl_inst_abr_prog_cntr_3`
+   in `presi_idx.h` with consistent mangling (`.` → `_`, `[N]` → `_N`).
+   A Python tool can name-mangle VCD signals to IDX entries and write
+   a presi snapshot at a given Verilator cycle.  Excellent debugging:
+   if the gate netlist diverges from RTL, snapshot at successive
+   cycles and bisect to find the divergence point.  Requires
+   abr_wrap.cpp to also dump the SRAM contents (Verilator doesn't
+   include them in VCD by default).
+
+7. **Stage 5 — end-to-end Dilithium keygen byte-compare.**
+   Generate inputs (`python3 flow/mldsa-gen.py keygen <message> <xi>
+   <rho'>`), run cosim (~1-3 hour wall at 5 cyc/s), compare
+   `pk_out.dat` / `sk_out.dat` byte-for-byte against `./abr_wrap
+   mldsa-keygen`'s reference output.  Snapshot chaining (item 4)
+   makes this practical: chunk the run into pieces that fit a
+   single iteration window, and rejoin them in a final `dump-pk`
+   / `dump-sk` from the last snapshot.  Record cycle count.
+
+8. **SRAM port-width truncation.**  The naive fix -- defer
    `blackbox m:*abr_1r1w_ram*` until *after* `hierarchy -check -top`
    so paramod variants are made with per-instance widths -- was tried
    on 2026-05-07 and abandoned.  Yosys ran past 25 min / 17 GB RSS in
@@ -591,20 +705,14 @@ Priorities, in rough order:
    skipping the SRAM blackbox entirely and letting `memory -nomap`
    infer `$mem_v2` cells.
 
-6. **Cross-validate against Verilator VCD.**  Architecture: pick a
-   small set of registered signals (`busy_o`, `abr_prog_cntr[9:0]`,
-   `MLDSA_STATUS[3:0]`, `sampler_busy_o`, `ntt_busy`), have cosim
-   dump them per cycle, extend `readvcd` (or write a sibling parser)
-   to dump the same set from Verilator's VCD, align on the
-   `MLDSA_CTRL=1` write, diff with ±1 cycle slack to allow for the
-   cosim's one-phase boundary lag.  Useful for catching divergence
-   precisely and comparing internal state, not just I/O.
-
-7. **TVLA toggle hook.**  Now that state lives in flat byte arrays,
+9. **TVLA toggle hook.**  Now that state lives in flat byte arrays,
    the per-cycle delta is one `__builtin_popcount(presi_s[i] ^
    presi_s_prev[i])` loop.  Hook this into the harness alongside the
    FSM trace; output should slot into the existing `tvla.py` /
-   `readvcd` post-processing pipeline.
+   `readvcd` post-processing pipeline.  The snapshot mechanism makes
+   this trivially parallelisable: build N fixed + M random `init`
+   snapshots, run each through a `presi-run` invocation, accumulate
+   toggle counts.
 
-8. **Stages 6–7.**  Wider trace hooks and leakage instrumentation,
-   building on (6) and (7).
+10. **Stages 6–7.**  Wider trace hooks and leakage instrumentation,
+    building on (6) and (9).

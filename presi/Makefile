@@ -48,15 +48,30 @@ GATES_STAMP     := $(BUILD)/$(TOP).gate-c.stamp
 # single multi-million-statement function.  Bump if compile time per TU
 # starts to dominate; lower if link time dominates.
 GATE_C_PARTS    ?= 32
+# Within each part .c, the body is further sliced into static helper
+# functions of CHUNK_SIZE statements each, all called in topo order from
+# the public step_part_NNN function.  This caps gcc's per-basic-block
+# work (var-tracking, liveness, register allocation) at a tractable
+# size.  Empirically: -O0 cost is roughly linear with chunk size for
+# the small-chunk regime, and -O1 becomes affordable.  CHUNK_SIZE=0
+# disables chunking (one body, useful for diff against the pre-refactor
+# layout).
+CHUNK_SIZE      ?= 8192
 GATE_PART_IDX   := $(shell python3 -c "print(' '.join(f'{i:03d}' for i in range($(GATE_C_PARTS))))")
 GATES_PART_C    := $(foreach i,$(GATE_PART_IDX),$(BUILD)/$(TOP).presi_clk_part_$(i).c)
 GATES_PART_O    := $(GATES_PART_C:.c=.o)
 GATES_VAR_O     := $(GATES_VAR_C:.c=.o)
 PRESI           := $(BUILD)/presi
 PRESI_GATES     := $(BUILD)/presi-gates
-CSRC            := presi.c presi_sram.c
+# Harness .c sources.  Compiled into per-flavor .o files
+# (.gates.o for the no-engines build, .cosim.o for the cosim build).
+# The cosim flavor's .o files plus all gate-netlist .o files are
+# bundled into libpresi_gates.a so iterating on presi.c only triggers
+# a relink, not a recompile of the netlist code.
+HARNESS_SRC     := presi.c presi_gates.c presi_state.c presi_sram.c
+HARNESS_HDRS    := presi_model.h presi_gates.h presi_state.h presi_sram.h
 
-.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top abr-seq-core engine-glue cosim run run-gates run-cosim run-cosim-keygen inventory clean
+.PHONY: all sv2v netlist-coarse netlist-blackbox netlist-gates gate-c sram-meta seq-rom ntt-top abr-sampler-top abr-seq-core engine-glue cosim lib run run-gates run-cosim run-cosim-keygen inventory clean
 
 all: $(PRESI)
 
@@ -109,6 +124,7 @@ gate-c: $(GATES_STAMP) $(GATES_BB_WIRING)
 $(GATES_STAMP): $(GATES_SPICE) $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(GATES_SPICE) \
 		--top $(TOP) --num-parts $(GATE_C_PARTS) \
+		--chunk-size $(CHUNK_SIZE) \
 		--vars $(GATES_VAR_H) --vars-c $(GATES_VAR_C) \
 		--clock $(GATES_CLK_H) --parts-dir $(BUILD) \
 		--map $(GATES_MAP) --bb $(GATES_BB)
@@ -193,6 +209,7 @@ $(BUILD)/ntt_top.gates.stat.rpt: $(BUILD)/ntt_top.gates.ys
 $(BUILD)/ntt_top.gate-c.stamp: $(BUILD)/ntt_top.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/ntt_top.gates.sp \
 		--top ntt_top --num-parts $(NTT_GATE_C_PARTS) \
+		--chunk-size $(CHUNK_SIZE) \
 		--symbol-prefix 'ntt_top__' \
 		--vars $(BUILD)/ntt_top.presi_var.h \
 		--vars-c $(BUILD)/ntt_top.presi_var.c \
@@ -235,6 +252,7 @@ $(BUILD)/abr_sampler_top.gates.json $(BUILD)/abr_sampler_top.gates.stat.rpt: \
 $(BUILD)/abr_sampler_top.gate-c.stamp: $(BUILD)/abr_sampler_top.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_sampler_top.gates.sp \
 		--top abr_sampler_top --num-parts $(SAMPLER_GATE_C_PARTS) \
+		--chunk-size $(CHUNK_SIZE) \
 		--symbol-prefix 'abr_sampler_top__' \
 		--vars $(BUILD)/abr_sampler_top.presi_var.h \
 		--vars-c $(BUILD)/abr_sampler_top.presi_var.c \
@@ -282,6 +300,7 @@ $(BUILD)/abr_seq.gates.stat.rpt: $(BUILD)/abr_seq.gates.ys
 $(BUILD)/abr_seq.gate-c.stamp: $(BUILD)/abr_seq.gates.sp $(FLOW)/spice_to_c.py
 	python3 $(FLOW)/spice_to_c.py --spice $(BUILD)/abr_seq.gates.sp \
 		--top abr_seq --num-parts $(SEQ_GATE_C_PARTS) \
+		--chunk-size $(CHUNK_SIZE) \
 		--symbol-prefix 'abr_seq__' \
 		--vars $(BUILD)/abr_seq.presi_var.h \
 		--vars-c $(BUILD)/abr_seq.presi_var.c \
@@ -346,8 +365,8 @@ inventory: $(INVENTORY)
 $(INVENTORY): $(BLACKBOX_JSON) $(FLOW)/netlist_inventory.py
 	python3 $(FLOW)/netlist_inventory.py --json $(BLACKBOX_JSON) --out $@
 
-$(PRESI): $(CSRC) presi_sram.h $(SRAM_H) | $(BUILD)
-	gcc -std=c99 -Wall -Wextra -O0 -I$(BUILD) -I. -o $@ $(CSRC)
+$(PRESI): $(HARNESS_SRC) $(HARNESS_HDRS) $(SRAM_H) | $(BUILD)
+	gcc -std=c99 -Wall -Wextra -O0 -I$(BUILD) -I. -o $@ $(HARNESS_SRC)
 
 # Optimization level for the giant generated gate-update files.
 # Measurements 2026-05-07 on the 49 MB ntt_top.presi_clk_part_001.c:
@@ -368,33 +387,23 @@ CFLAGS_GATES    := -std=c99 -Wall -Wextra $(GATES_OPT) -DPRESI_HAVE_NETLIST \
                    -I$(BUILD) -I.
 
 # Per-part and var.c objects are compiled in parallel via `make -j`.
+# These are flavor-independent (only need PRESI_HAVE_NETLIST).
 $(BUILD)/$(TOP).presi_clk_part_%.o: $(BUILD)/$(TOP).presi_clk_part_%.c $(GATES_VAR_H)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
 $(GATES_VAR_O): $(GATES_VAR_C) $(GATES_VAR_H)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
-$(PRESI_GATES): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) $(GATES_VAR_H) \
-                $(GATES_IDX_H) $(GATES_CLK_H) $(GATES_BB_WIRING) \
-                $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
-	gcc $(CFLAGS_GATES) -o $@ $(CSRC) $(GATES_VAR_O) $(GATES_PART_O)
-
-# Co-simulation binary: presi-gates plus the per-engine gate netlists
-# for ntt_top and abr_sampler_top, glued to abr_wrap's blackbox pins by
-# the .glue.o files.  Built only when the engine artifacts exist (run
-# `make ntt-top abr-sampler-top engine-glue` first).  Defines
-# PRESI_HAVE_ENGINE_NETLISTS so presi.c calls the per-engine step glues.
+# Engine .o files (also flavor-independent: each is a self-contained
+# block of cell statements that doesn't reference engine-glue externs).
 NTT_VAR_O           := $(BUILD)/ntt_top.presi_var.o
 SAMPLER_VAR_O       := $(BUILD)/abr_sampler_top.presi_var.o
 NTT_PART_O          := $(foreach i,$(NTT_GATE_PART_IDX),$(BUILD)/ntt_top.presi_clk_part_$(i).o)
 SAMPLER_PART_O      := $(foreach i,$(SAMPLER_GATE_PART_IDX),$(BUILD)/abr_sampler_top.presi_clk_part_$(i).o)
 PRESI_GATES_COSIM   := $(BUILD)/presi-gates-cosim
+LIB_PRESI_GATES     := $(BUILD)/libpresi_gates.a
 CFLAGS_COSIM        := $(CFLAGS_GATES) -DPRESI_HAVE_ENGINE_NETLISTS
 
-# Pattern rules for per-engine .o (var + parts).  Each engine's part .c
-# files and var.c #include their own presi_var.h via spice_to_c.py;
-# the prefix-distinct externs (ntt_top__*, abr_sampler_top__*) keep
-# them link-compatible with abr_wrap's no-prefix flow.
 $(NTT_VAR_O): $(BUILD)/ntt_top.presi_var.c $(BUILD)/ntt_top.gate-c.stamp
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 $(BUILD)/ntt_top.presi_clk_part_%.o: $(BUILD)/ntt_top.presi_clk_part_%.c \
@@ -408,7 +417,83 @@ $(BUILD)/abr_sampler_top.presi_clk_part_%.o: \
                 $(BUILD)/abr_sampler_top.gate-c.stamp
 	gcc $(CFLAGS_GATES) -c -o $@ $<
 
+# ---- Harness object files, two flavors.
+#
+# .gates.o : compiled with CFLAGS_GATES (no engine references)
+# .cosim.o : compiled with CFLAGS_COSIM (engine externs visible)
+#
+# We build distinct .o paths because presi_gates.c and presi_state.c
+# branch on PRESI_HAVE_ENGINE_NETLISTS to pull in the per-engine
+# glue + extra snapshot sections; same .c file, two object files.
+# presi.c also gets two flavors so it picks up the right state code.
+# presi_sram.c is flag-agnostic and only needs one .o.
+
+PRESI_C_HDR_DEPS    := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H)
+PRESI_GATES_C_HDRS  := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H) \
+                       $(GATES_CLK_H) $(GATES_BB_WIRING) $(SEQ_ROM_H)
+PRESI_STATE_C_HDRS  := presi_state.h presi_model.h $(GATES_VAR_H)
+
+$(BUILD)/presi.gates.o: presi.c $(PRESI_C_HDR_DEPS)
+	gcc $(CFLAGS_GATES) -c -o $@ presi.c
+$(BUILD)/presi.cosim.o: presi.c $(PRESI_C_HDR_DEPS)
+	gcc $(CFLAGS_COSIM) -c -o $@ presi.c
+
+$(BUILD)/presi_gates.gates.o: presi_gates.c $(PRESI_GATES_C_HDRS)
+	gcc $(CFLAGS_GATES) -c -o $@ presi_gates.c
+$(BUILD)/presi_gates.cosim.o: presi_gates.c $(PRESI_GATES_C_HDRS)
+	gcc $(CFLAGS_COSIM) -c -o $@ presi_gates.c
+
+$(BUILD)/presi_state.gates.o: presi_state.c $(PRESI_STATE_C_HDRS)
+	gcc $(CFLAGS_GATES) -c -o $@ presi_state.c
+$(BUILD)/presi_state.cosim.o: presi_state.c $(PRESI_STATE_C_HDRS) \
+                              $(BUILD)/ntt_top.presi_var.h \
+                              $(BUILD)/abr_sampler_top.presi_var.h
+	gcc $(CFLAGS_COSIM) -c -o $@ presi_state.c
+
+$(BUILD)/presi_sram.o: presi_sram.c presi_sram.h $(SRAM_H)
+	gcc $(CFLAGS_GATES) -c -o $@ presi_sram.c
+
+PRESI_GATES_HARNESS_O   := $(BUILD)/presi.gates.o $(BUILD)/presi_gates.gates.o \
+                           $(BUILD)/presi_state.gates.o $(BUILD)/presi_sram.o
+PRESI_COSIM_HARNESS_O   := $(BUILD)/presi.cosim.o $(BUILD)/presi_gates.cosim.o \
+                           $(BUILD)/presi_state.cosim.o $(BUILD)/presi_sram.o
+# Harness .o files that go INTO libpresi_gates.a (everything except
+# presi.cosim.o, which is the binary's main TU and stays out of the
+# archive so multiple binaries can link the same library).
+PRESI_LIB_HARNESS_O     := $(BUILD)/presi_gates.cosim.o \
+                           $(BUILD)/presi_state.cosim.o $(BUILD)/presi_sram.o
+
+# ---- presi-gates: no-engines binary (control-plane smoke).
+$(PRESI_GATES): $(PRESI_GATES_HARNESS_O) $(GATES_VAR_O) $(GATES_PART_O) | $(BUILD)
+	gcc $(CFLAGS_GATES) -o $@ $(PRESI_GATES_HARNESS_O) \
+		$(GATES_VAR_O) $(GATES_PART_O)
+
+# ---- libpresi_gates.a: cosim flavor.  Bundles all gate-netlist .o
+# files plus the cosim-flavor harness .o files (presi_gates / state /
+# sram).  Iterating on presi.c only relinks; nothing in the archive
+# is touched.  Archive size is whatever the constituent .o files
+# total -- ~258 MB for the current build.
+LIB_PRESI_GATES_OBJS    := $(GATES_VAR_O) $(GATES_PART_O) \
+                           $(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
+                           $(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O) \
+                           $(PRESI_LIB_HARNESS_O)
+
+$(LIB_PRESI_GATES): $(LIB_PRESI_GATES_OBJS) | $(BUILD)
+	rm -f $@
+	ar rcs $@ $(LIB_PRESI_GATES_OBJS)
+
+# Standalone library build (`make lib`) -- useful when iterating on
+# generated headers / netlist code without producing a binary.
+lib: $(LIB_PRESI_GATES)
+
 cosim: $(PRESI_GATES_COSIM)
+
+# Cosim binary: presi.cosim.o + libpresi_gates.a.  Editing presi.c
+# triggers exactly one .o recompile + one link (~30 s vs the ~12 min
+# clean cosim rebuild).
+$(PRESI_GATES_COSIM): $(BUILD)/presi.cosim.o $(LIB_PRESI_GATES) | $(BUILD)
+	gcc $(CFLAGS_COSIM) -o $@ $(BUILD)/presi.cosim.o \
+		-L$(BUILD) -lpresi_gates
 
 # Smoke run -- kicks the FSM with the existing 256-cycle poll trace.
 run-cosim: $(PRESI_GATES_COSIM)
@@ -422,19 +507,7 @@ run-cosim: $(PRESI_GATES_COSIM)
 KEYGEN_MAX_CYCLES   ?= 200000
 
 run-cosim-keygen: $(PRESI_GATES_COSIM)
-	./$(PRESI_GATES_COSIM) keygen $(KEYGEN_MAX_CYCLES)
-
-$(PRESI_GATES_COSIM): $(CSRC) presi_sram.h $(SRAM_H) $(SEQ_ROM_H) \
-                $(GATES_VAR_H) $(GATES_IDX_H) $(GATES_CLK_H) \
-                $(GATES_BB_WIRING) \
-                $(GATES_VAR_O) $(GATES_PART_O) \
-                $(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
-                $(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O) \
-                | $(BUILD)
-	gcc $(CFLAGS_COSIM) -o $@ $(CSRC) \
-		$(GATES_VAR_O) $(GATES_PART_O) \
-		$(NTT_VAR_O) $(NTT_PART_O) $(NTT_GLUE_O) \
-		$(SAMPLER_VAR_O) $(SAMPLER_PART_O) $(SAMPLER_GLUE_O)
+	./$(PRESI_GATES_COSIM) -t $(KEYGEN_MAX_CYCLES) mldsa-keygen
 
 run: $(PRESI)
 	./$(PRESI)

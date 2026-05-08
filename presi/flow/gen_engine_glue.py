@@ -267,9 +267,12 @@ def emit_glue(out_path, engine, instance, prefix, num_parts,
         f.write("extern presi_t %s[];\n" % eng_array)
         f.write("extern presi_t %s;\n" % eng_clk_prev)
 
-        # Engine step functions.
+        # Engine step functions.  Post-2026-05-08 they take the
+        # netlist's `<prefix>presi_s` array pointer as their argument
+        # (see spice_to_c.py `--chunk-size` refactor); we pass it
+        # explicitly at every call site below.
         for i in range(num_parts):
-            f.write("extern void %spresi_step_part_%03d(void);\n" %
+            f.write("extern void %spresi_step_part_%03d(presi_t *);\n" %
                     (prefix, i))
 
         # Find the engine's clk port-bit pair (used for clk_prev update).
@@ -319,7 +322,8 @@ def emit_glue(out_path, engine, instance, prefix, num_parts,
 
         f.write("\n\t/* step engine */\n")
         for i in range(num_parts):
-            f.write("\t%spresi_step_part_%03d();\n" % (prefix, i))
+            f.write("\t%spresi_step_part_%03d(%s);\n" %
+                    (prefix, i, eng_array))
         if clk_pin_idx is not None:
             clk_eng = eng_expr(engine_c_name(prefix, "clk", 0, 1))
             if clk_eng is not None:

@@ -40,8 +40,10 @@ sv2v.v ─┬───► gen_yosys.py (mode=blackbox-sram) ──► yosys ─�
                                                                         ▼
                                                        extract_seq_rom.py ──► seq_rom.h + seq_rom.json
 
-      presi.c + presi_sram.c + abr_wrap parts                                  ──► presi-gates
-      (above) + ntt_top + abr_sampler_top parts + glue.o                       ──► presi-gates-cosim
+      presi.gates.o + presi_gates.gates.o + presi_state.gates.o +              ──► presi-gates
+                                  presi_sram.o + abr_wrap parts                  (no engines, smoke only)
+      all gate .o + presi_gates.cosim.o + presi_state.cosim.o + presi_sram.o   ──► libpresi_gates.a
+      presi.cosim.o + libpresi_gates.a                                         ──► presi-gates-cosim
 ```
 
 ## Architectural overview: array-layout C model

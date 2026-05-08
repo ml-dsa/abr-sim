@@ -103,23 +103,50 @@ Build entry points:
 - `make -C presi ntt-top` / `make -C presi abr-sampler-top` / `make -C presi abr-seq-core` — per-engine gate flows.  Each runs Yosys with `engine-gates` mode (no blackboxing -- the engine itself is gate-mapped) on `--top <engine>`, then `spice_to_c.py` with `--symbol-prefix='<engine>__'` so the per-engine arrays are link-compatible with abr_wrap.  ntt_top: 2.07 M cells, 1m06s; abr_sampler_top: 2.06 M cells, 1m32s; abr_seq: trivial (1 NOT + 1 $mem_v2).
 - `make -C presi engine-glue` — generates `<engine>.glue.c` files via `gen_engine_glue.py`; each file copies abr_wrap-side bb-pin slots ↔ engine-side port slots through `presi_s[<idx>]` ↔ `<engine>__presi_s[<idx>]`, with literal indices baked in from the map CSVs.  ntt_top: 1934 bits (1484 in / 450 out), abr_sampler_top: 2021 bits (114 in / 1907 out -- sampler_state_data_o alone is 1600 bits of SHA3 squeeze state).
 - `make -C presi gate-c` — translates the SPICE into C: a 12-line `<top>.presi_var.h`, ~150-byte `<top>.presi_var.c`, a `<top>.presi_idx.h` (named-port `#define`s), 32 `presi_clk_part_NNN.c` TUs (8 for engines), `presi_map.csv`, `presi_bb.csv`, and `presi_clk.h` dispatcher.
-- `make -C presi -j 4 cosim` — clean rebuild ~12 min: builds **`presi-gates-cosim`** (258 MB, links abr_wrap + ntt_top + abr_sampler_top netlists + glue).  After 64 reset cycles plus 64 idle cycles, AHB NAME/VERSION/STATUS reads return the expected hardwired constants.  Writing `MLDSA_CTRL=1` walks the abr_seq ROM through real Dilithium-keygen UOPs (LD_SHAKE256 → SHAKE256 → LFSR → SHAKE256 → REJB s1[0..1]) within a 256-cycle smoke window -- engine handshakes (sampler_busy_o, SHA3 absorb/squeeze, rejection sampling) all running through gates.
+- `make -C presi -j 4 lib` — clean build ~12 min: produces **`_build/libpresi_gates.a`** (~258 MB), the static archive that bundles all gate-netlist .o files (abr_wrap + ntt_top + abr_sampler_top var/part/glue) plus the cosim-flavor harness .o files (`presi_gates.cosim.o`, `presi_state.cosim.o`, `presi_sram.o`).  Iterating on `presi.c` afterwards only triggers a single .o recompile + relink (~30 s).
+- `make -C presi -j 4 cosim` — builds the **`presi-gates-cosim`** binary by linking `presi.cosim.o` against the library archive.  After reset, AHB NAME/VERSION/STATUS reads return the expected hardwired constants; smoke run walks the first abr_seq ROM UOPs (LD_SHAKE256 → SHAKE256 → LFSR → SHAKE256 → REJB s1[0..1]).
 - `make -C presi run-cosim` — runs the smoke harness.  ~5 cyc/s with all three netlists co-stepping at -O0.
-- `make -C presi run-cosim-keygen [KEYGEN_MAX_CYCLES=N]` — drives full Dilithium keygen: load `seed_in.dat` + optional `ent_in.dat`, write CTRL, poll STATUS for READY|VALID, dump `pk_out.dat` / `sk_out.dat`.  ~1-3 hours wall for a real keygen.
+- `make -C presi run-cosim-keygen [KEYGEN_MAX_CYCLES=N]` — drives full Dilithium keygen via `presi-cosim -t N mldsa-keygen`.  ~1-3 hours wall for a real keygen.
 - `make -C presi -j 4 run-gates` — abr_wrap-only build (no engines).  Stalls at MLDSA_KG_S waiting for the unwired engines, but useful as a control-plane smoke test.
 - `make -C presi run` — non-netlist harness for sub-second sanity.
 
+`presi-cosim`'s CLI mirrors `src/abr_wrap.cpp` (positional `<operation>` + `-t <n>` + `-seed/-ent/-pk/-sk/...` file slots) plus presi-only `-load <fn>` / `-save <fn>` / `-init-only`.  Special operations beyond the abr_wrap set: `smoke` (default), `run` (load+step+save, no AHB driver), `dump-pk` / `dump-sk` (load+AHB-read+write).  See `presi/state-plan.md` for the snapshot file format and the snapshot-driven workflow that lets each individual experiment finish under a 5-minute wall budget.
+
 `GATES_OPT` Makefile knob defaults to `-O0` (5.7 s per part .c, ~12 min clean rebuild).  `-O1` is tractable post-array-layout (1m57s per part .c, ~24 min rebuild) but isn't the default.
 
-Five load-bearing details that are easy to break:
+Six load-bearing details that are easy to break:
 
 1. **Yosys ≥ 0.64 is required.**  Older 0.36's `proc` is 5–10× slower on this design (25+ minute hangs on the `proc_mux` step over abr_ctrl's FSM).  The newer release also has lower peak memory.
 2. **Use `opt`, not `opt_clean`, after `proc` in the gates flow.** sv2v leaves parameter expressions like `$clog2(MLDSA_Q)+1` as runtime arithmetic.  Without full `opt`, abr_wrap carries ~1200 spurious `$mul` cells that techmap then expands to millions of gates and OOMs the box.
 3. **sv2v `--top abr_wrap` inlines `abr_top` + `abr_ctrl` + `abr_mem_top`** into one flat `abr_wrap` module (they communicate via SV interfaces `abr_mem_if` / `abr_sram_if`, which sv2v collapses).  They cannot be blackboxed individually.  This is fine for presi — that's the layer we want gate-mapped — but it's why `gen_yosys.py`'s `ENGINE_MODULES` blackboxes engines at the `abr_top`-instantiation boundary instead.  `abr_seq` is on that list too because `proc` doesn't terminate on its 1024-way `unique case`; ROM contents come from a separate `make seq-rom` target.
 4. **No ABC, no BUF/NAND lowering.** Both ran the inlined abr_wrap into swap.  `spice_to_c.py` handles Yosys's gate primitives directly.
 5. **DFFs are edge-triggered with `presi_clk_prev`, comb is topo-sorted.**  Each `$_DFF_P_`/`$_DFFSR_PPP_` cell emits as `if ((presi_s[<clk>] & ~presi_clk_prev & 1)) presi_s[<Q>] = presi_s[<D>];` so the flop only ticks on a true 0→1 transition regardless of how many `presi_step_netlist()` calls happen per phase.  Combinational statements within a part file are ordered by dataflow (Kahn's topo sort over (writer, reader) of comb nets, with reads of flop outputs treated as stable inputs).  Together these give a correct one-step-per-phase cycle without re-clocking the flops or reading stale comb values.
+6. **Snapshot save/load saves the whole `presi_s[]` array verbatim, but the load path always runs `presi_settle_after_load()` after restore.** That settle is one comb-only `presi_step_netlist()` call (clock unchanged, so no flops tick).  This makes the format tolerant of "flop-only" snapshots — a future Python writer can leave comb wires at zero and they will become consistent on the first step.  The harness owns the settle; never skip it after a load.
 
 Don't add an `if (!busy_o) return;` skip to `presi_engines_step()`.  That gate stalls the engines on the cycle after `MLDSA_CTRL=1` was written -- `busy_o` lags by one cycle, so the engines miss the first edge where the controller drives sampler inputs.  Re-introduce only with explicit clk_prev maintenance during the skipped phases.
+
+### Snapshot-driven workflow
+
+`presi/state-plan.md` documents the snapshot file format and CLI in
+detail.  Quick examples:
+
+```sh
+# Build a "moment of CTRL=KEYGEN" snapshot (~30 s after first build):
+./presi-gates-cosim -seed seed_in.dat -ent ent_in.dat \
+                    -save kg-init.bin -init-only mldsa-keygen
+
+# Advance a snapshot 1500 cycles (~5 min wall):
+./presi-gates-cosim -load kg-init.bin -save kg-1.bin -t 1500 run
+
+# Dump pk from a finished snapshot (still uses AHB internally):
+./presi-gates-cosim -load kg-done.bin -pk pk_out.dat dump-pk
+
+# Round-trip self-test (save -> load -> save must be byte-identical):
+presi/tools/snapshot-roundtrip.sh
+```
+
+Six load-bearing details (one for the snapshot bit) added to the list
+below.
 
 ## Default file conventions
 
