@@ -1,12 +1,61 @@
 #!/usr/bin/env python3
 
 import argparse
+import re
+import subprocess
 
 
 SRAM_MODULES = [
     "abr_1r1w_ram",
     "abr_1r1w_be_ram",
 ]
+
+
+def discover_sram_paramods(in_file, flow_dir, top):
+    """Run a quick Yosys probe to elaborate paramod variants of the
+    SRAM modules.  Returns a list of fully-qualified paramod module
+    names (e.g. `$paramod$<hash>\\abr_1r1w_ram`) corresponding to the
+    actual SRAM instance widths used in the design.
+
+    Used by `gates` mode: hierarchy creates per-instance paramod
+    variants of `abr_1r1w_ram` / `abr_1r1w_be_ram` with proper
+    DEPTH/DATA_WIDTH; we then blackbox each variant by exact name in
+    the main pass so subsequent passes see SRAM port stubs at full
+    widths instead of the default-truncated DEPTH=64/DATA_WIDTH=32.
+
+    The probe takes ~7 s (read_verilog + hierarchy only).  Hashes are
+    deterministic for a given SystemVerilog source, so they're stable
+    across runs as long as the upstream RTL doesn't change.
+    """
+    probe = (
+        "read_verilog -lib %s/cmos_cells.v\n"
+        "read_verilog -sv %s\n"
+        # Engines blackboxed pre-hierarchy (matches gates mode below).
+        "blackbox abr_sampler_top\n"
+        "blackbox ntt_top\n"
+        "blackbox abr_seq\n"
+        "hierarchy -check -top %s\n"
+        "ls\n"
+    ) % (flow_dir, in_file, top)
+    # No `-q`: with -q yosys silences log output, including the
+    # `ls` command's module list, leaving us with nothing to grep.
+    out = subprocess.run(
+        ["yosys", "-p", probe],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        raise SystemExit("yosys probe failed:\n" + out.stderr[-2000:])
+    pat = re.compile(
+        r"^\s+(\$paramod\$[0-9a-f]+\\(?:abr_1r1w_ram|abr_1r1w_be_ram))$",
+        re.M,
+    )
+    names = pat.findall(out.stdout)
+    if not names:
+        raise SystemExit(
+            "yosys probe found no abr_1r1w_ram* paramod variants -- "
+            "the SRAM-truncation post-hierarchy blackbox approach "
+            "requires hierarchy to specialise per-instance widths.")
+    return sorted(set(names))
 
 # Modules blackboxed only in `gates` mode.  Keeping these as RTL would push the
 # gate netlist past available memory during ABC, or stall `proc` for tens of
@@ -54,36 +103,46 @@ def emit_common(f, args):
     if args.mode in ("gates", "engine-gates"):
         f.write("read_verilog -lib %s/cmos_cells.v\n" % args.flow_dir)
     f.write("read_verilog -sv %s\n" % args.in_file)
-    if args.mode in ("blackbox-sram", "gates"):
+
+    # blackbox-sram mode: pre-hierarchy SRAM blackbox (works for the
+    # netlist-blackbox flow where `extract_sram_meta.py` reads the
+    # SystemVerilog parameter expressions directly off the cell
+    # instantiation).  No paramod specialisation is needed here.
+    if args.mode == "blackbox-sram":
         for mod in SRAM_MODULES:
             f.write("blackbox %s\n" % mod)
-        # Engines + abr_seq are also blackboxed in blackbox-sram mode so
-        # `proc` doesn't burn 10+ minutes elaborating their giant case
-        # statements; we don't need them for SRAM metadata anyway.  In
-        # gates mode the same set is required to keep the gate count and
-        # `proc` runtime in budget.
         for mod in ENGINE_MODULES:
             f.write("blackbox %s\n" % mod)
-    # KNOWN WIDTH-TRUNCATION ISSUE: the blackbox above happens before
-    # hierarchy creates paramod variants, so all SRAM cell instances are
-    # forced to the *default* port widths (DEPTH=64, DATA_WIDTH=32 for
-    # abr_1r1w_ram).  write_spice then truncates the wider connections.
-    # The harness's SRAM model exercises only those low 32 data bits and
-    # 6 address bits.
-    #
-    # Tried (2026-05-07) and abandoned: deferring SRAM blackbox until
-    # *after* `hierarchy -check -top abr_wrap` (so paramod variants get
-    # per-instance widths) then `blackbox m:*abr_1r1w_ram*`.  Yosys ran
-    # to >25 min / >17 GB RSS in that flow and was still in `proc` /
-    # `opt` when we killed it -- well past the project's 5-minute
-    # build budget.  Documented as a follow-up; if revisited, look at
-    # cheaper alternatives like `chparam`, manual paramod-named
-    # blackboxes in cmos_cells.v, or the `$mem_v2`-infer path.
-    # engine-gates mode (per-engine TVLA flow): no blackboxing.  When
-    # the per-engine top is itself one of ENGINE_MODULES (e.g. ntt_top),
-    # blackboxing it would leave the netlist empty -- and we *want*
-    # everything inside the engine gate-mapped for leakage analysis.
+
+    # gates mode: blackbox engines pre-hierarchy (their bodies aren't
+    # needed and would push proc/opt past budget) and then run
+    # hierarchy so it creates per-instance paramod variants of
+    # abr_1r1w_ram / abr_1r1w_be_ram with their proper widths.  Each
+    # paramod variant gets blackboxed by exact name afterwards (the
+    # names were probed via discover_sram_paramods() before the
+    # script was emitted).  This unwinds the historical "SRAM port-
+    # width truncation" limitation: we now expose addr=10/11 and
+    # data=96 etc. instead of the default DEPTH=64/DATA_WIDTH=32.
+    # Pre-hierarchy `blackbox abr_1r1w_ram` would have prevented
+    # specialisation; post-hierarchy `blackbox m:*abr_1r1w_ram*`
+    # didn't work because Yosys's m: selection language doesn't
+    # match `$paramod$<hash>\\<name>` module names with the leading
+    # `$paramod$` segment.
+    if args.mode == "gates":
+        for mod in ENGINE_MODULES:
+            f.write("blackbox %s\n" % mod)
     f.write("hierarchy -check -top %s\n" % args.top)
+    if args.mode == "gates":
+        for nm in args.sram_paramods:
+            # Yosys's command tokeniser uses `\\` to escape special
+            # chars; we duplicate to match the actual module name.
+            f.write("blackbox %s\n" % nm.replace("\\", "\\\\"))
+        # The originals are now unused (every cell instance was
+        # specialised to a paramod variant).  Delete them so Yosys
+        # doesn't carry their bodies through subsequent passes.
+        for mod in SRAM_MODULES:
+            f.write("delete %s\n" % mod)
+
     f.write("proc\n")
     if args.mode in ("gates", "engine-gates"):
         # opt (full, not -fast or opt_clean) folds parameter expressions like
@@ -148,6 +207,15 @@ def main():
     args = ap.parse_args()
     if args.mode in ("gates", "engine-gates") and args.spice_out is None:
         raise SystemExit("--spice-out is required for %s mode" % args.mode)
+
+    args.sram_paramods = []
+    if args.mode == "gates":
+        args.sram_paramods = discover_sram_paramods(
+            args.in_file, args.flow_dir, args.top)
+        print("gen-yosys: discovered %d SRAM paramod variants:" %
+              len(args.sram_paramods))
+        for n in args.sram_paramods:
+            print("  " + n)
 
     with open(args.script, "w", encoding="utf-8") as f:
         emit_common(f, args)

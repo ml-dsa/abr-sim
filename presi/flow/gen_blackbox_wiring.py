@@ -29,6 +29,18 @@ import re
 
 SRAM_MODULES = ("abr_1r1w_ram", "abr_1r1w_be_ram")
 
+# Paramod variants written by Yosys's write_spice as
+# `_paramod_<hex>_<base_module>` (the original RTLIL name
+# `$paramod$<hex>\<base>` gets `$` and `\` mangled to `_`).  Each
+# paramod variant carries the per-instance widths so write_spice
+# emits all addr/data bits instead of the default-truncated 6/32.
+SRAM_PARAMOD_RE = re.compile(
+    r"^_paramod_[0-9a-f]+_(abr_1r1w(?:_be)?_ram)$")
+
+
+def is_sram_module(module):
+    return module in SRAM_MODULES or SRAM_PARAMOD_RE.match(module) is not None
+
 # abr_seq is blackboxed at the SV-module boundary in the gates flow (so
 # `proc` doesn't burn 10+ minutes elaborating its 1024-way unique case).
 # bb.csv records its 99 pins (clk, en_i, addr_i[10], data_o[87]) in SV
@@ -378,7 +390,7 @@ def emit(out_path, instances, srams, seq_meta):
     seq_full_width = seq_meta["full_width"] if seq_meta is not None else 87
     seq_abits = seq_meta["abits"] if seq_meta is not None else 10
     for inst, module, pins in instances:
-        if module in SRAM_MODULES:
+        if is_sram_module(module):
             ports = group_pins(pins)
             we_pins = [(s, c, i) for s, c, i in pins
                        if classify_port(split_port(s)[0]) == "we_i"]

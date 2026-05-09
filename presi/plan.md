@@ -234,11 +234,10 @@ Exit criteria:
   - **AHB output capture happens BEFORE the flop tick**, in phase 1 between `_comb` and `_flop`.  This matches what an AHB master sees on a rising edge: the slave's combinational `hrdata_o` / `hreadyout_o` is computed from values registered on the *previous* edge, just before the about-to-occur tick replaces them.  Capturing post-tick (or post-settle) makes `dv` (cpuif_req) deassert and the abr_reg readback mux gates to '0 -- a hidden bug for several commits before it was caught by NAME / VERSION reads coming back as 0.
   - `presi_engines_step_*()` is called every phase and unconditionally invokes both engine step glues.  Two earlier gating attempts have been reverted (see [busy_o gate trap](../../.claude/projects/-home-mjos-ai-rv-abr-sim/memory/busy_o_gate_trap.md) and [Engine engagement gate dead end](../../.claude/projects/-home-mjos-ai-rv-abr-sim/memory/engine_gate_dead_end.md)).  Both broke because the gate signal lags the controller by one cycle (read pre-flop-tick), so a one-cycle start pulse is missed entirely.  Re-introducing engine gating requires either reading the gate post-flop-tick (one-cycle skew between abr_wrap and engine timing) or gating on a stable-throughout-engagement signal that gives no savings inside keygen.
   - `ahb_read()` and `ahb_write()` use the textbook 1-cycle address + 1-cycle data phase.  `abr_ahb_slv_sif` registers (addr, dv, write) at posedge; abr_reg's readback mux is fully combinational from those, and the AHB-side wdata mux is combinational from `hwdata_i` with the lane chosen by registered `addr[2]`.  `ahb_read()` additionally spins on `hreadyout_o` so external regions (PUBKEY/PRIVKEY) which abr_reg stalls via `external_pending` are handled correctly.
-  - Known limitation: **SRAM port-width truncation.**  The pre-hierarchy `blackbox abr_1r1w_ram` keeps every SRAM cell at the *default* port widths (DEPTH=64, DATA_WIDTH=32) regardless of per-instance overrides.  `write_spice` then truncates the wider connections, so the netlist exposes only addr=6 / data=32 to each SRAM (instead of e.g. addr=10 / data=96 for `mem_inst0_bank0`).  The harness's SRAM storage stays at the full declared width so nothing is lost on reads/writes inside the C model, but the netlist itself can only exercise the low 32 data bits and 6 address bits.  Two known-correct fixes (post-hierarchy `blackbox m:*<mod>*` to keep paramod variants, or skipping the SRAM blackbox entirely so memory pass infers `$mem_v2` cells) both push Yosys past the 5-minute build budget; documented in `gen_yosys.py` for follow-up.
+  - **SRAM port-width truncation -- fixed 2026-05-09.**  The original pre-hierarchy `blackbox abr_1r1w_ram` kept every SRAM cell at the *default* port widths (DEPTH=64, DATA_WIDTH=32), so `write_spice` truncated the wider connections.  The new approach in `flow/gen_yosys.py`'s `gates` mode runs a small Yosys probe (`discover_sram_paramods()`) to elaborate per-instance paramod variants of `abr_1r1w_ram` and `abr_1r1w_be_ram`, then blackboxes each variant by exact name *after* `hierarchy -check -top` in the main pass.  `gen_blackbox_wiring.py` recognises the paramod-mangled module names (`_paramod_<hex>_abr_1r1w*`) via `is_sram_module()`.  bb_wiring.h now samples the full per-instance widths (e.g. `mem_inst0_bank0` at addr=10 / data=96 instead of addr=6 / data=32).  Build still fits the 5-min budget (~2:30 Yosys + spice_to_c).  Probing m:*<mod>* selectors didn't work because Yosys's selection language doesn't match the leading `$paramod$` segment in module names; the fix uses literal `blackbox <full-paramod-name>` lines emitted after probing the actual hashes.
 
   What remains:
-  - End-to-end Dilithium keygen byte-compare against Verilator wrapper (Stage 5, `make run-cosim-keygen`; multi-hour wall via snapshot-chained chunks).
-  - SRAM port-width truncation fix (known dead end without a different strategy).
+  - End-to-end Dilithium / ML-KEM keygen byte-compare against Verilator (Stage 5).  ML-KEM keygen smoke shows cycle-perfect match for the first 18 PCs (pc=443..462), then diverges starting at pc=462→463 (presi 78 cy faster than Verilator) and stalls at pc=468.  Confirmed not the SRAM truncation -- root cause likely engine co-sim timing (standalone gate elaboration of `abr_sampler_top` / `ntt_top` may have a flop pipeline-depth difference vs the abr_top-instantiated RTL).  See `~/.claude/.../engine_cosim_divergence.md` for diagnosis candidates.
   - TVLA toggle hook (now a one-liner with the array layout; see "Where to pick up next" item 9).
 
 ## Simulator semantics
@@ -769,16 +768,30 @@ Priorities, in rough order:
    single iteration window, and rejoin them in a final `dump-pk`
    / `dump-sk` from the last snapshot.  Record cycle count.
 
-8. **SRAM port-width truncation.**  The naive fix -- defer
-   `blackbox m:*abr_1r1w_ram*` until *after* `hierarchy -check -top`
-   so paramod variants are made with per-instance widths -- was tried
-   on 2026-05-07 and abandoned.  Yosys ran past 25 min / 17 GB RSS in
-   `proc`/`opt` and was killed; the whole gates flow is held to a
-   5-minute budget (`GATE_TIMEOUT=300s` in the Makefile).  Cheaper
-   alternatives to consider before retrying: `chparam` on the original
-   blackbox, manually-named paramod blackboxes in `cmos_cells.v`, or
-   skipping the SRAM blackbox entirely and letting `memory -nomap`
-   infer `$mem_v2` cells.
+8. ~~**SRAM port-width truncation.**~~ Fixed 2026-05-09.  The
+   working approach: `flow/gen_yosys.py`'s `discover_sram_paramods()`
+   runs a small Yosys probe to elaborate per-instance paramod
+   variants of `abr_1r1w_ram` / `abr_1r1w_be_ram`, then the main
+   pass blackboxes each variant by literal name post-hierarchy +
+   deletes the originals so subsequent passes don't re-elaborate
+   their bodies.  `gen_blackbox_wiring.py`'s `is_sram_module()`
+   recognises the paramod-mangled type names emitted by
+   `write_spice` (`_paramod_<hex>_abr_1r1w*`).  Two earlier dead
+   ends -- post-hierarchy `m:*abr_1r1w_ram*` selection and
+   `delete m:.../c:*` to drop bodies -- failed because Yosys's
+   selection language doesn't match `$paramod$<hex>\\<name>`
+   module names with a `*` glob, and `blackbox` doesn't actually
+   purge module bodies even after `clean -purge`.  The literal-
+   name approach (with hashes pre-discovered by a 7-second
+   probe) sidesteps both issues.
+
+   **Important:** fixing SRAM truncation did NOT resolve the
+   mlkem-keygen cycle divergence vs Verilator past pc=462.
+   The first ~4000 cycles don't exercise the high SRAM lanes,
+   so cycle counts to pc=468 are byte-identical pre-fix and
+   post-fix.  Root cause for the divergence is elsewhere
+   (likely engine co-sim timing); see Stage 4 "What remains"
+   above and `engine_cosim_divergence.md`.
 
 9. **TVLA toggle hook.**  Now that state lives in flat byte arrays,
    the per-cycle delta is one `__builtin_popcount(presi_s[i] ^
