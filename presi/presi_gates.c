@@ -288,27 +288,33 @@ void presi_cycle(struct presi_model *m)
     abr_sampler_top__presi_clk_prev = PRESI_0;
 # endif
 
-    /* Phase 1: rising edge.  Comb settles with clk=1, then flops
-     * tick (their `_edge` reads clk_prev=0 from above), then engines
-     * tick similarly.  After this, clk_prev becomes 1 (engine glue
-     * _flop updates engine clk_prev as a side effect; we update
-     * abr_wrap's here). */
+    /* Phase 1: rising edge.  Comb settles with clk=1 PRE-flop-tick;
+     * outputs are captured at this point because that's what an AHB
+     * master sees on the rising edge -- the slave's combinational
+     * hrdata_o / hreadyout_o computed from the values registered
+     * on the PREVIOUS edge, before the about-to-occur tick replaces
+     * them.  In particular, `dv` (cpuif_req) is still 1 during the
+     * data phase here; after the tick it becomes 0 and the abr_reg
+     * readback mux would gate to '0. */
     m->p.clk = PRESI_1;
     presi_apply_inputs(m);
     presi_step_netlist_comb();
     presi_engines_step_comb();
+    presi_capture_outputs(m);
+
+    /* Now tick flops on the rising edge. */
     presi_step_netlist_flop();
     presi_engines_step_flop();
     presi_clk_prev = PRESI_1;
 
     /* Settle pass: refresh abr_wrap comb downstream of the engine
-     * output paste from _flop, and let engines re-derive comb from
-     * refreshed abr_wrap inputs.  No flops tick (clk_prev=1=clk). */
+     * output paste from _flop and post-tick flop outputs so SRAM
+     * tick samples consistent registered inputs.  No flops tick
+     * (clk_prev=1=clk). */
     presi_step_netlist_comb();
     presi_engines_step_comb();
 
     presi_sram_tick_all(m);
-    presi_capture_outputs(m);
 #else
     (void) m;
 #endif

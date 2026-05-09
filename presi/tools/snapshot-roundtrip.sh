@@ -34,7 +34,7 @@ cd "$WORK"
 
 # Generate deterministic test inputs.  ent_in.dat is optional; we let
 # the harness default it to all-zero, so just produce seed_in.dat.
-python3 ../../flow/mldsa-gen.py keygen >/dev/null
+python3 ../../../flow/mldsa-gen.py keygen >/dev/null
 cmp seed_in.dat <(printf '') 2>/dev/null && {
     echo "seed_in.dat is empty -- check flow/mldsa-gen.py" >&2
     exit 1

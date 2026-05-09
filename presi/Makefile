@@ -477,7 +477,7 @@ PRESI_C_HDR_DEPS    := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H)
 PRESI_GATES_C_HDRS  := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H) \
                        $(GATES_CLK_COMB_H) $(GATES_CLK_FLOP_H) \
                        $(GATES_BB_WIRING) $(SEQ_ROM_H)
-PRESI_STATE_C_HDRS  := presi_state.h presi_model.h $(GATES_VAR_H)
+PRESI_STATE_C_HDRS  := presi_state.h presi_model.h $(SRAM_H) $(GATES_VAR_H)
 
 $(BUILD)/presi.gates.o: presi.c $(PRESI_C_HDR_DEPS)
 	gcc $(CFLAGS_GATES) -c -o $@ presi.c
