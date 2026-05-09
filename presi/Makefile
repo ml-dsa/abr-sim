@@ -415,21 +415,28 @@ $(INVENTORY): $(BLACKBOX_JSON) $(FLOW)/netlist_inventory.py
 $(PRESI): $(HARNESS_SRC) $(HARNESS_HDRS) $(SRAM_H) | $(BUILD)
 	gcc -std=c99 -Wall -Wextra -O0 -I$(BUILD) -I. -o $@ $(HARNESS_SRC)
 
-# Optimization level for the giant generated gate-update files.
-# Measurements 2026-05-07 on the 49 MB ntt_top.presi_clk_part_001.c:
-#   gcc -O0    17 s   <-- default
-#   clang -O0  13 s
-#   gcc -Og    48 s
-#   gcc -O1   ~5 min
-#   gcc -O1 -fno-tree-pre -fno-tree-fre -fno-tree-coalesce-vars  4m45s
-#   clang -O1  8m44s   (worse than gcc at this size)
-#   gcc -Os    8m34s
-# At 48 part files in the cosim binary, only -O0 (and marginally -Og)
-# fit the 5-minute clean-rebuild budget.  The per-cycle slowdown vs
-# -O0 wasn't measured for -Og since the compile budget is tight.
-# Override with `make ... GATES_OPT=-Og` for a long-running build
-# where you don't mind a 10 min clean compile.
-GATES_OPT       ?= -O0
+# Optimization level for the gate-update chunk .c files.
+# Measurements 2026-05-09 (post comb/flop split + edge-1 specialised
+# flops + `~` form; 1326 chunk .c files, heaviest ~408 KB):
+#
+#   Setting           Build wall  Smoke (384 cy)  Cyc/s  Binary
+#   gcc -O0 -j 8       ~7 min       2:48           2.3   480 MB
+#   gcc -Og -j 8        5:33        0:45           8.5   124 MB  <-- default
+#   gcc -O1 -j 4        ~22 min*    -              -     -
+#   clang -O1 -j 16     ~30 min*    -              -     -
+#
+# *projected; both abandoned because they hit a per-chunk cliff at
+# -O1 (gcc 4 s/chunk, clang 11-22 s/chunk) that doesn't shrink with
+# more parallelism (the chunks themselves are register-allocator
+# bound, not throughput bound).  -Og hits the sweet spot: most
+# optimisations on, but the slow ones (PRE, FRE, coalesce-vars,
+# instruction scheduling) skipped.  ~3.7x runtime over -O0.
+#
+# Override with `make ... GATES_OPT=-O0` for the fastest cold
+# rebuild (~7 min at -j 8) when iterating on the harness; or
+# `GATES_OPT=-O1` if you have ~25 min to burn for marginal extra
+# runtime.
+GATES_OPT       ?= -Og
 CFLAGS_GATES    := -std=c99 -Wall -Wextra $(GATES_OPT) -DPRESI_HAVE_NETLIST \
                    -I$(BUILD) -I.
 
