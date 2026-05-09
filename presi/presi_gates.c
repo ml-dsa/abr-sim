@@ -431,10 +431,63 @@ void ahb_read_block(struct presi_model *m, uint32_t addr,
     }
 }
 
-int wait_for_status(struct presi_model *m, uint32_t want_mask,
-                    uint32_t error_mask, uint64_t max_cycles, int verbose)
+/* ============================================================
+ * FSM trace
+ * ============================================================
+ *
+ * When `presi_fsm_trace_enabled` is set, callers that loop on
+ * `presi_cycle()` (especially `wait_for_status_addr` below) can
+ * call `presi_fsm_trace_step()` after each cycle to print a
+ * `[seq] cyc=N pc=M` line on every PC transition.  Output is
+ * line-comparable with the Verilator wrapper's `[seq]` log
+ * (the abr_seq_decode `+offs` form is dropped here -- numeric
+ * PC is enough for cycle-count diffing).
+ */
+
+int presi_fsm_trace_enabled = 0;
+
+#ifdef PRESI_HAVE_NETLIST
+static const int _fsm_pc_idx[10] = {
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_0,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_1,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_2,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_3,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_4,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_5,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_6,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_7,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_8,
+    IDX_top0_abr_ctrl_inst_abr_prog_cntr_9,
+};
+#endif
+
+int presi_fsm_trace_step(struct presi_model *m, int *prev_pc)
+{
+#ifdef PRESI_HAVE_NETLIST
+    int pc = (int) presi_read_bits(_fsm_pc_idx, 10);
+    if (pc != *prev_pc) {
+        printf("[seq]\tcyc=%llu  pc=%d\n",
+               (unsigned long long) m->cycle, pc);
+        *prev_pc = pc;
+        return 1;
+    }
+    return 0;
+#else
+    (void) m; (void) prev_pc;
+    return 0;
+#endif
+}
+
+/* ============================================================
+ * Status polling
+ * ============================================================ */
+
+static int wait_for_status_addr(struct presi_model *m, uint32_t status_addr,
+                                uint32_t want_mask, uint32_t error_mask,
+                                uint64_t max_cycles, int verbose)
 {
     int prev = -1;
+    int prev_pc = -1;
     uint64_t start = m->cycle;
     uint64_t deadline = start + max_cycles;
 
@@ -443,7 +496,10 @@ int wait_for_status(struct presi_model *m, uint32_t want_mask,
         if (m->cycle >= deadline) {
             return -1;
         }
-        st = ahb_read(m, ABR_STATUS);
+        st = ahb_read(m, status_addr);
+        if (presi_fsm_trace_enabled) {
+            (void) presi_fsm_trace_step(m, &prev_pc);
+        }
         if (verbose && (int) st != prev) {
             printf("[STAT]\tcycle=%llu  status=%08x%s%s%s\n",
                    (unsigned long long) m->cycle, st,
@@ -458,14 +514,27 @@ int wait_for_status(struct presi_model *m, uint32_t want_mask,
         if ((st & want_mask) == want_mask) {
             return (int) st;
         }
-        /* Quietly advance a few cycles between status reads. */
+        /* Advance a few cycles between status reads.  Per-cycle
+         * FSM trace fires inside this inner loop so PC transitions
+         * land on the right cycle number (status reads add ~3
+         * cycles each, which would otherwise distort the trace). */
         {
             int j;
             for (j = 0; j < 32 && m->cycle < deadline; j++) {
                 presi_cycle(m);
+                if (presi_fsm_trace_enabled) {
+                    (void) presi_fsm_trace_step(m, &prev_pc);
+                }
             }
         }
     }
+}
+
+int wait_for_status(struct presi_model *m, uint32_t want_mask,
+                    uint32_t error_mask, uint64_t max_cycles, int verbose)
+{
+    return wait_for_status_addr(m, ABR_STATUS, want_mask, error_mask,
+                                max_cycles, verbose);
 }
 
 /* ============================================================
@@ -608,4 +677,95 @@ int mldsa_keygen(struct presi_model *m, uint64_t max_cycles,
     rc = mldsa_keygen_run(m, max_cycles);
     if (rc != 0) return rc;
     return mldsa_keygen_finish(m, pk_fn, sk_fn);
+}
+
+/* ============================================================
+ * ML-KEM-1024 keygen
+ * ============================================================
+ *
+ * AHB write seq: ABR_ENTROPY (optional), MLKEM_SEED_D, MLKEM_SEED_Z,
+ *                MLKEM_CTRL = 1.
+ * Poll MLKEM_STATUS for READY|VALID, gated on MLKEM_ERROR.
+ * Output: MLKEM_ENCAPS_KEY (1568 B) + MLKEM_DECAPS_KEY (3168 B).
+ */
+
+int mlkem_keygen_init(struct presi_model *m,
+                      const char *ent_fn,
+                      const char *seed_d_fn, const char *seed_z_fn)
+{
+    uint32_t entropy[SZ_U32(ENTROPY_SZ)] = {0};
+    uint32_t seed_d[SZ_U32(MLKEM_SEED_SZ)] = {0};
+    uint32_t seed_z[SZ_U32(MLKEM_SEED_SZ)] = {0};
+    uint64_t c0, c1;
+
+    read_dat(entropy, ENTROPY_SZ, ent_fn, 1);
+    read_dat(seed_d,  MLKEM_SEED_SZ, seed_d_fn, 0);
+    read_dat(seed_z,  MLKEM_SEED_SZ, seed_z_fn, 0);
+
+    c0 = m->cycle;
+    printf("[KEMKG]\tcycle=%llu  loading entropy + d + z\n",
+           (unsigned long long) c0);
+    ahb_write_block(m, ABR_ENTROPY,   entropy, SZ_U32(ENTROPY_SZ));
+    ahb_write_block(m, MLKEM_SEED_D,  seed_d,  SZ_U32(MLKEM_SEED_SZ));
+    ahb_write_block(m, MLKEM_SEED_Z,  seed_z,  SZ_U32(MLKEM_SEED_SZ));
+
+    c1 = m->cycle;
+    printf("[KEMKG]\tcycle=%llu  writing CTRL=KEYGEN (load=%llu cy)\n",
+           (unsigned long long) c1, (unsigned long long) (c1 - c0));
+    ahb_write(m, MLKEM_CTRL, CTRL_KEYGEN);
+    return 0;
+}
+
+int mlkem_keygen_run(struct presi_model *m, uint64_t max_cycles)
+{
+    uint64_t c0 = m->cycle;
+    int st;
+
+    st = wait_for_status_addr(m, MLKEM_STATUS,
+                              ABR_STATUS_READY | ABR_STATUS_VALID,
+                              ABR_STATUS_MLKEM_ERROR, max_cycles, 1);
+    if (st < 0) {
+        printf("[KEMKG]\tTIMEOUT after %llu cycles\n",
+               (unsigned long long) (m->cycle - c0));
+        return 1;
+    }
+    if (st & ABR_STATUS_MLKEM_ERROR) {
+        printf("[KEMKG]\tERROR status=%08x\n", (unsigned) st);
+        return 2;
+    }
+    printf("[KEMKG]\tREADY|VALID in %llu cycles\n",
+           (unsigned long long) (m->cycle - c0));
+    return 0;
+}
+
+int mlkem_keygen_finish(struct presi_model *m,
+                        const char *ek_fn, const char *dk_fn)
+{
+    uint32_t ek[SZ_U32(MLKEM_EK_SZ)] = {0};
+    uint32_t dk[SZ_U32(MLKEM_DK_SZ)] = {0};
+
+    if (ek_fn != NULL) {
+        printf("[KEMKG]\treading encaps key (%u bytes)\n", MLKEM_EK_SZ);
+        ahb_read_block(m, MLKEM_ENCAPS_KEY, ek, SZ_U32(MLKEM_EK_SZ));
+        write_dat(ek, MLKEM_EK_SZ, ek_fn);
+    }
+    if (dk_fn != NULL) {
+        printf("[KEMKG]\treading decaps key (%u bytes)\n", MLKEM_DK_SZ);
+        ahb_read_block(m, MLKEM_DECAPS_KEY, dk, SZ_U32(MLKEM_DK_SZ));
+        write_dat(dk, MLKEM_DK_SZ, dk_fn);
+    }
+    return 0;
+}
+
+int mlkem_keygen(struct presi_model *m, uint64_t max_cycles,
+                 const char *ent_fn,
+                 const char *seed_d_fn, const char *seed_z_fn,
+                 const char *ek_fn, const char *dk_fn)
+{
+    int rc;
+    rc = mlkem_keygen_init(m, ent_fn, seed_d_fn, seed_z_fn);
+    if (rc != 0) return rc;
+    rc = mlkem_keygen_run(m, max_cycles);
+    if (rc != 0) return rc;
+    return mlkem_keygen_finish(m, ek_fn, dk_fn);
 }

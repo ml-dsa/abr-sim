@@ -30,19 +30,31 @@
 #define MLDSA_PUBKEY            0x1000u
 #define MLDSA_PRIVKEY_OUT       0x4000u
 
+#define MLKEM_CTRL              0x9010u
+#define MLKEM_STATUS            0x9014u
+#define MLKEM_SEED_D            0x9018u
+#define MLKEM_SEED_Z            0x9038u
+#define MLKEM_DECAPS_KEY        0xa000u
+#define MLKEM_ENCAPS_KEY        0xb000u
+
 /* Byte sizes of register regions (matches src/abr_wrap.cpp). */
 #define MLDSA_PUBKEY_SZ         2592u
 #define MLDSA_PRIVKEY_SZ        4896u
 #define MLDSA_SEED_SZ           0x20u
 #define ENTROPY_SZ              0x40u
 
-/* CTRL command codes. */
+#define MLKEM_SEED_SZ           0x20u
+#define MLKEM_EK_SZ             1568u
+#define MLKEM_DK_SZ             3168u
+
+/* CTRL command codes (same encoding for both engines: bit 0 = keygen). */
 #define CTRL_KEYGEN             1u
 
 /* STATUS bits. */
 #define ABR_STATUS_READY        0x00000001u
 #define ABR_STATUS_VALID        0x00000002u
 #define ABR_STATUS_MLDSA_ERROR  0x00000008u
+#define ABR_STATUS_MLKEM_ERROR  0x00000004u
 
 /* AHB-Lite transaction encodings (htrans_i). */
 #define AHB_TRANS_IDLE          0u
@@ -99,6 +111,15 @@ int wait_for_status(struct presi_model *m, uint32_t want_mask,
 size_t read_dat(uint32_t *buf, size_t bufsz, const char *fn, int optional);
 size_t write_dat(const uint32_t *buf, size_t bufsz, const char *fn);
 
+/* ---- FSM trace.  When `presi_fsm_trace_enabled` is non-zero,
+ * `wait_for_status()` (and any caller that opts in) prints the
+ * controller's program-counter and a few status flags on every PC
+ * transition.  Output format mirrors `[seq] cyc: NAME +offs` from
+ * the Verilator wrapper so logs are diff-able by milestone.
+ * Returns 0 on PC unchanged, 1 on transition (and printed). */
+extern int presi_fsm_trace_enabled;
+int presi_fsm_trace_step(struct presi_model *m, int *prev_pc);
+
 /* ---- High-level orchestration: ML-DSA-87 keygen.
  * Each phase callable independently, so one binary can run only the
  * AHB-init phase (snapshot save), or only the wait phase (snapshot
@@ -111,5 +132,20 @@ int mldsa_keygen_finish(struct presi_model *m,
 int mldsa_keygen(struct presi_model *m, uint64_t max_cycles,
                  const char *ent_fn, const char *seed_fn,
                  const char *pk_fn, const char *sk_fn);
+
+/* ---- High-level orchestration: ML-KEM-1024 keygen.  Same shape as
+ * mldsa_keygen but with seed_d_in.dat / seed_z_in.dat as inputs and
+ * ek_out.dat / dk_out.dat as outputs.  Drives MLKEM_CTRL (0x9010)
+ * with bit 0 set to start, then polls MLKEM_STATUS until READY|VALID. */
+int mlkem_keygen_init(struct presi_model *m,
+                      const char *ent_fn,
+                      const char *seed_d_fn, const char *seed_z_fn);
+int mlkem_keygen_run(struct presi_model *m, uint64_t max_cycles);
+int mlkem_keygen_finish(struct presi_model *m,
+                        const char *ek_fn, const char *dk_fn);
+int mlkem_keygen(struct presi_model *m, uint64_t max_cycles,
+                 const char *ent_fn,
+                 const char *seed_d_fn, const char *seed_z_fn,
+                 const char *ek_fn, const char *dk_fn);
 
 #endif

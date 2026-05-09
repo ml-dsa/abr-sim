@@ -201,6 +201,8 @@ static int parse_argv(int argc, char **argv, struct slots *s,
             s->init_only = 1; i += 1;
         } else if (strcmp(a, "-no-output") == 0) {
             s->no_output = 1; i += 1;
+        } else if (strcmp(a, "-trace-fsm") == 0) {
+            presi_fsm_trace_enabled = 1; i += 1;
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             puts(usage); return -1;
         } else if (*op_name == NULL && a[0] != '-') {
@@ -407,12 +409,41 @@ static int run_dump_sk(struct presi_model *m, const struct slots *s)
     return mldsa_keygen_finish(m, NULL, s->sk_out_fn);
 }
 
+static int run_mlkem_keygen(struct presi_model *m, const struct slots *s)
+{
+    int rc;
+    if (s->load_fn == NULL) {
+        rc = mlkem_keygen_init(m, s->ent_in_fn,
+                               s->seed_d_in_fn ? s->seed_d_in_fn : "seed_d_in.dat",
+                               s->seed_z_in_fn ? s->seed_z_in_fn : "seed_z_in.dat");
+        if (rc != 0) return rc;
+        if (s->save_fn != NULL && s->init_only) {
+            return 0;
+        }
+    }
+    if (s->max_cycle <= 0 && s->init_only) {
+        return 0;
+    }
+    rc = mlkem_keygen_run(m,
+                          s->max_cycle > 0 ? (uint64_t) s->max_cycle : 1000000ull);
+    if (rc != 0) {
+        if (s->save_fn != NULL) return 0;
+        return rc;
+    }
+    if (s->no_output) {
+        return 0;
+    }
+    return mlkem_keygen_finish(m,
+                               s->ek_out_fn ? s->ek_out_fn : "ek_out.dat",
+                               s->dk_out_fn ? s->dk_out_fn : "dk_out.dat");
+}
+
 static int known_unimpl_op(const char *op)
 {
     static const char *const u[] = {
         "mldsa-sign", "mldsa-verify", "mldsa-kgsign",
         "mldsa-sign-extmu", "mldsa-sign-stream",
-        "mlkem-keygen", "mlkem-encaps", "mlkem-decaps", "mlkem-kgdecaps",
+        "mlkem-encaps", "mlkem-decaps", "mlkem-kgdecaps",
         "sign", "verify", "kgsign",
     };
     unsigned i;
@@ -488,6 +519,8 @@ int main(int argc, char **argv)
         rc = run_smoke(&model);
     } else if (strcmp(op_name, "mldsa-keygen") == 0) {
         rc = run_mldsa_keygen(&model, &s);
+    } else if (strcmp(op_name, "mlkem-keygen") == 0) {
+        rc = run_mlkem_keygen(&model, &s);
     } else if (strcmp(op_name, "run") == 0) {
         rc = run_steps(&model, &s);
     } else if (strcmp(op_name, "dump-pk") == 0) {
