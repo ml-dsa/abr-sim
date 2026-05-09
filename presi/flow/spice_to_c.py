@@ -64,7 +64,13 @@ def fold_not(a):
         return _K1
     if _is1(a):
         return _K0
-    return "(%s ^ %s)" % (a, _K1)
+    # `~x` over a uint8_t promotes to int (-Woverflow trips on `~PRESI_1`
+    # as a constant, but the folder above eliminates the only constant
+    # case before this branch is reached, so `~<expr>` here is always
+    # over a runtime presi_t expression and the truncation back to
+    # uint8_t is what gcc actually emits).  Cheaper than `^ PRESI_1`
+    # because it doesn't materialise the 0xFF constant on the right.
+    return "~%s" % a if a.startswith(("(", "s[", "~")) else "~(%s)" % a
 
 
 def fold_and(a, b):
@@ -107,11 +113,11 @@ def fold_xor(a, b):
 # (PRESI_1 = 0xFF, PRESI_0 = 0x00), so AND/OR/XOR/etc. compose without
 # `& 1` masks and bit 0 of every result is always the logical value.
 #
-# `^ PRESI_1` is preferred over `~x`: bitwise NOT works on uint8_t but
-# `~PRESI_1` is `~(int)0xFF = -256` in C's promoted-int arithmetic,
-# which trips `-Woverflow` warnings when Yosys ties an input to a
-# constant.  XOR with PRESI_1 has the same semantics for our invariant
-# (flips every bit) and never warns.
+# `~x` is the inversion form (one machine NOT, no immediate load),
+# applied only to runtime expressions; the peephole folder collapses
+# `~PRESI_0` / `~PRESI_1` to the opposite constant before emit, so
+# the `-Woverflow` case (~ over a known-0xFF constant trips int
+# promotion) never reaches the source.
 #
 # write_spice port order (Yosys "guessed" order = reverse cell-connection
 # iteration; output first, then inputs reversed):
@@ -295,13 +301,14 @@ def emit_dff(kind, names, pins, flops, clk_prev):
     qref = names.ref(q)
     dref = names.ref(d)
     cref = names.ref(clk)
-    # Per-flop body references the chunk-local `_edge` (declared once at
-    # the top of every chunk that contains flops; see write_part_files).
-    # All flops in a netlist share the same clk pin and clk_prev global,
-    # so hoisting the `clk & ~clk_prev` mask out of every line cuts the
-    # source size ~2x for DFFSR-heavy chunks.
-    body = fold_or(fold_and("_edge", dref),
-                   fold_and(fold_not("_edge"), qref))
+    # The harness calls `*_step_part_NNN_flop()` only on the rising edge
+    # (presi_cycle phase 1; never phase 0 or settle), so `_edge` is
+    # always 1 when the body executes.  Specialise: substitute PRESI_1
+    # for `_edge` and let the peephole folder collapse the multiplexer
+    # to `Q = D` (or, for DFFSR, `Q = S | (~S & ~R & D)`).  Saves ~6
+    # operations per flop and keeps the chunk free of the `_edge` local.
+    body = fold_or(fold_and(_K1, dref),
+                   fold_and(fold_not(_K1), qref))
     stmt = "%s = %s;" % (qref, body)
     flops.add(qref)
     return {"stmt": stmt, "lhs": qref, "rhs": [cref, dref], "is_flop": True}
@@ -335,11 +342,11 @@ def emit_dffsr(kind, names, pins, flops, clk_prev):
     rref = names.ref(r)
     dref = names.ref(d)
     cref = names.ref(clk)
-    # See emit_dff for the `_edge` rationale: the rising-edge mask is
-    # the same for every flop in a chunk, so we declare it once per
-    # chunk in write_part_files and just reference it here.
-    transfer = fold_or(fold_and("_edge", dref),
-                       fold_and(fold_not("_edge"), qref))
+    # See emit_dff: the harness calls _flop only on the rising edge,
+    # so `_edge` is always 1.  Substitute PRESI_1 and fold; the
+    # transfer collapses to D, leaving body = S | (~S & ~R & D).
+    transfer = fold_or(fold_and(_K1, dref),
+                       fold_and(fold_not(_K1), qref))
     body = fold_or(sref,
                    fold_and(fold_not(sref),
                             fold_and(fold_not(rref), transfer)))
@@ -429,12 +436,13 @@ def write_part_files(parts_dir, top, header_basename, statements, num_parts,
       and settle) since comb wires must always be re-evaluated.
 
     * **flop chunks** -- `<top>.presi_clk_part_NNN_flop_MMM.c`
-      Pure flop tick statements (DFF + DFFSR).  Each chunk declares a
-      local `_edge = s[clk] & (clk_prev ^ PRESI_1)` once at the top
-      and every cell body uses it.  Called only on the rising-edge
-      phase; on falling-edge / settle, `_edge` would be 0 and the
-      ticks degenerate to no-ops, so skipping the call entirely
-      saves the otherwise-wasted compute.
+      Pure flop tick statements (DFF + DFFSR).  These chunks are
+      called only on the rising-edge phase, so `emit_dff` /
+      `emit_dffsr` substitute PRESI_1 for the edge mask and the
+      peephole folder reduces each cell to its edge=1 specialisation
+      (`Q = D` for DFF; `Q = S | (~S & ~R & D)` for DFFSR).  No
+      `_edge` local, no `clk_prev` read, no edge multiplexer in
+      the source.
 
     Each part also emits a small dispatcher file
     (`<top>.presi_clk_part_NNN.c`) with two public functions:
@@ -489,9 +497,10 @@ def write_part_files(parts_dir, top, header_basename, statements, num_parts,
                 f.write("/* Generated by spice_to_c.py.  Do not edit. */\n")
                 f.write('#include "%s"\n' % header_basename)
                 f.write("\nvoid %s(presi_t *s)\n{\n" % func_name)
-                if kind == "flop":
-                    f.write("\tpresi_t _edge = s[%d] & (%s ^ PRESI_1);\n" %
-                            (clk_pin_idx, clk_prev))
+                # No `_edge` local: emit_dff / emit_dffsr substitute
+                # PRESI_1 for the mask (flop chunks only run on the
+                # rising edge), so the peephole folder produced
+                # branch-free, edge-free statements.
                 for i in range(cstart, cend):
                     f.write("\t%s\n" % statements[i][0])
                 f.write("}\n")

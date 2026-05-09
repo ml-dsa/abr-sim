@@ -321,8 +321,24 @@ def emit_glue(out_path, engine, instance, prefix, num_parts,
             f.write("extern void %spresi_step_part_%03d_flop(presi_t *);\n"
                     % (prefix, i))
 
+        # Gate expression: OR of every gating-signal byte read from
+        # abr_wrap-side presi_s[].  presi_t maintains the all-or-no-bits
+        # invariant (0x00 / 0xFF), so a plain bitwise OR over the bytes
+        # is non-zero iff any signal is asserted.  When the result is
+        # zero the engine is idle and the whole step is skipped.
+        gate_exprs = []
+        for c in gate_pins:
+            ae = abr_expr(c)
+            if ae is not None:
+                gate_exprs.append(ae)
+        gate_test = " | ".join(gate_exprs) if gate_exprs else None
+
         # ---- comb glue: input copy + step_part_NNN_comb + output copy.
         f.write("\nvoid %s_step_glue_comb(void)\n{\n" % engine)
+        if gate_test is not None:
+            f.write("\t/* skip when no engagement signal is asserted "
+                    "(controller drives the engines one-at-a-time) */\n")
+            f.write("\tif (!(%s)) return;\n" % gate_test)
         f.write("\t/* abr_wrap -> engine inputs */\n")
         f.writelines(input_lines)
         f.write("\n\t/* step engine (comb only) */\n")
@@ -345,6 +361,9 @@ def emit_glue(out_path, engine, instance, prefix, num_parts,
         # values that drive abr_wrap pins; the settle pass that
         # follows needs them fresh.
         f.write("\nvoid %s_step_glue_flop(void)\n{\n" % engine)
+        if gate_test is not None:
+            f.write("\t/* same engagement gate as _comb */\n")
+            f.write("\tif (!(%s)) return;\n" % gate_test)
         f.write("\t/* step engine (flop only -- rising edge transfers) */\n")
         for i in range(num_parts):
             f.write("\t%spresi_step_part_%03d_flop(%s);\n" %
@@ -356,11 +375,6 @@ def emit_glue(out_path, engine, instance, prefix, num_parts,
         f.write("\n\t/* engine outputs -> abr_wrap */\n")
         f.writelines(output_lines)
         f.write("}\n")
-
-    if gate_pins:
-        # Diagnostic: gate-port inputs are recorded for documentation
-        # but no longer wired into a runtime gate (see Makefile note).
-        pass
 
     inputs = sum(1 for _, _, d, _ in pin_seq if d == "input")
     outputs = sum(1 for _, _, d, _ in pin_seq if d == "output")

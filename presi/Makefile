@@ -378,14 +378,16 @@ $(NTT_GLUE_C): $(GATES_BB) $(GATES_MAP) $(BUILD)/ntt_top.gates.v \
 		--engine-prefix 'ntt_top__' \
 		--engine-num-parts $(NTT_GATE_C_PARTS) \
 		--out $@
-	# Note: per-engine `--gate-on-port` was removed 2026-05-07.  Gating
-	# inside the glue had a subtle clk_prev staleness bug -- when the
-	# gate skipped a step, the engine's `presi_clk_prev` stayed at the
-	# previous-step's clk, so when the gate next fired the rising-edge
-	# predicate `(clk & ~clk_prev)` could be 0 and miss an edge.  The
-	# outer `busy_o`-based gate in `presi_engines_step()` covers the
-	# common idle case (reset, post-completion).  Re-introduce
-	# per-engine gating only with explicit clk_prev maintenance.
+	# `--gate-on-port` removed (again).  See comments in
+	# gen_engine_glue.py: the gate test reads abr_wrap bb-pin slots
+	# pre-flop-tick, so when the controller asserts a one-cycle start
+	# pulse AT a rising edge, the engine misses that edge entirely
+	# (gate=0 at pre-tick read, gate=1 only afterwards in the settle
+	# pass when no flop tick remains in this cycle).  A correct fix
+	# requires either (a) reading the gate post-tick at the cost of a
+	# one-cycle skew between abr_wrap and engine flop timing, or
+	# (b) gating on a stable-throughout-engagement signal like
+	# `mldsa_keygen_process` (which gives no savings inside keygen).
 
 $(SAMPLER_GLUE_C): $(GATES_BB) $(GATES_MAP) $(BUILD)/abr_sampler_top.gates.v \
                    $(BUILD)/abr_sampler_top.presi_map.csv $(FLOW)/gen_engine_glue.py
@@ -397,7 +399,7 @@ $(SAMPLER_GLUE_C): $(GATES_BB) $(GATES_MAP) $(BUILD)/abr_sampler_top.gates.v \
 		--engine-prefix 'abr_sampler_top__' \
 		--engine-num-parts $(SAMPLER_GATE_C_PARTS) \
 		--out $@
-	# See ntt_top above re: --gate-on-port removed.
+	# See ntt_top above re: gate-on-port reverted.
 
 $(NTT_GLUE_O): $(NTT_GLUE_C)
 	gcc $(CFLAGS_GATES) -c -o $@ $<
