@@ -44,6 +44,7 @@ GATES_CLK_FLOP_H:= $(BUILD)/$(TOP).presi_clk_flop.h
 GATES_MAP       := $(BUILD)/$(TOP).presi_map.csv
 GATES_BB        := $(BUILD)/$(TOP).presi_bb.csv
 GATES_BB_WIRING := $(BUILD)/$(TOP).presi_bb_wiring.h
+GATES_SEQ_TICK  := $(BUILD)/$(TOP).presi_seq_tick.h
 GATES_STAMP     := $(BUILD)/$(TOP).gate-c.stamp
 # Cycle-update body is split across this many TUs so gcc never compiles a
 # single multi-million-statement function.  Bump if compile time per TU
@@ -157,10 +158,11 @@ $(GATES_VAR_H) $(GATES_VAR_C) $(GATES_IDX_H) $(GATES_CLK_COMB_H) $(GATES_CLK_FLO
 # Blackbox wiring header: turns presi_bb.csv pin lists into the body of
 # presi_sram_tick_all(), one block per SRAM instance plus an abr_seq
 # $mem_v2 ROM block.
-$(GATES_BB_WIRING): $(GATES_BB) $(SRAM_JSON) $(SEQ_ROM_JSON) \
+$(GATES_BB_WIRING) $(GATES_SEQ_TICK): $(GATES_BB) $(SRAM_JSON) $(SEQ_ROM_JSON) \
                     $(FLOW)/gen_blackbox_wiring.py
 	python3 $(FLOW)/gen_blackbox_wiring.py --bb $(GATES_BB) \
-		--sram-json $(SRAM_JSON) --seq-rom-json $(SEQ_ROM_JSON) --out $@
+		--sram-json $(SRAM_JSON) --seq-rom-json $(SEQ_ROM_JSON) \
+		--out $(GATES_BB_WIRING)
 
 sram-meta: $(SRAM_JSON) $(SRAM_H)
 
@@ -485,7 +487,7 @@ $(BUILD)/abr_sampler_top.presi_clk_part_%.o: \
 PRESI_C_HDR_DEPS    := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H)
 PRESI_GATES_C_HDRS  := $(HARNESS_HDRS) $(SRAM_H) $(GATES_IDX_H) $(GATES_VAR_H) \
                        $(GATES_CLK_COMB_H) $(GATES_CLK_FLOP_H) \
-                       $(GATES_BB_WIRING) $(SEQ_ROM_H)
+                       $(GATES_BB_WIRING) $(GATES_SEQ_TICK) $(SEQ_ROM_H)
 PRESI_STATE_C_HDRS  := presi_state.h presi_model.h $(SRAM_H) $(GATES_VAR_H)
 
 $(BUILD)/presi.gates.o: presi.c $(PRESI_C_HDR_DEPS)

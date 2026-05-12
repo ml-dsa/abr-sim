@@ -342,15 +342,25 @@ def emit_seq_block(f, inst_xname, ports, full_width):
 
     abr_seq's behavior (rtl/abr_seq.sv):
       always_ff @(posedge clk) begin
-          if (en_i) data_o_rom <= ROM[addr_i];
-          else      data_o_rom <= '{ABR_UOP_NOP, ...};   // all zeros
+          if (en_i) data_o_rom <= ROM[addr_i];   // 1-cycle synchronous read
       end
       assign data_o = data_o_rom;
 
-    presi_sram_tick_all() runs after the rising edge, so we model the
-    flop by reading the *current* en_i/addr_i and updating data_o here.
-    The combinational `assign data_o = data_o_rom` is implicit -- we
-    drive data_o pins directly with the ROM word.
+    **Critical:** data_o_rom is a FLOP, so data_o has a 1-cycle latency
+    from any change in addr_i.  Reading addr_i from current presi_s and
+    immediately driving data_o (the previous design) gives a 0-cycle
+    combinational ROM, which exposes any cycle where `abr_prog_cntr_nxt`
+    momentarily transients to the next PC under feedback from
+    `ntt_busy_i` -- the abr_seq blackbox then races to ROM[next PC],
+    `abr_instr.opcode.mode.ntt_mode` changes, and the engine sees mode
+    flip mid-op.  This is the engine_cosim_divergence root cause for
+    mlkem-keygen pc=462 (NTT(e[3])) and pc=467 (PWA) shortening.
+
+    Fix: latch addr_i / en_i in a per-instance static state, sampled
+    at the end of every presi_cycle (presi_sram_tick_all is the
+    moment-just-before-the-next-rising-edge in the cycle model).
+    Drive data_o each cycle from the PREVIOUSLY latched value, which
+    gives the correct one-cycle latency Q := D@edge semantics.
 
     presi_abr_seq_rom[] holds the full SV-width (87-bit) values
     reassembled from the proc_rom-stripped INIT data plus the bit-map
@@ -359,27 +369,51 @@ def emit_seq_block(f, inst_xname, ports, full_width):
     data_pins = ports.get("data_o", [])
     en_pins = ports.get("en_i", [])
 
+    # Make a per-instance suffix so multiple abr_seq blackboxes
+    # (currently unlikely, but cheap insurance) wouldn't collide.
+    sfx = inst_xname.replace(".", "_").replace("$", "_")
+
     f.write("\t/* abr_seq blackbox (%s)\n"
             "\t * netlist exposes addr=%u data=%u (full width %u);\n"
-            "\t * driven from presi_abr_seq_rom[] in abr_wrap.seq_rom.h. */\n" %
+            "\t * driven from presi_abr_seq_rom[] in abr_wrap.seq_rom.h.\n"
+            "\t * data_o is modeled as a 1-cycle synchronous read: this\n"
+            "\t * call drives data_o from the addr that was latched at the\n"
+            "\t * end of the *previous* cycle, then samples the current\n"
+            "\t * addr_i for use at the next cycle. */\n" %
             (inst_xname, len(addr_pins), len(data_pins), full_width))
     f.write("\t{\n")
-    if en_pins:
-        f.write("\t\tunsigned _en = %s & 1;\n" % _ref(en_pins[0]))
-    else:
-        f.write("\t\tunsigned _en = 0u;  /* no en_i pin */\n")
-    f.write("\t\tuint32_t _addr = 0u")
-    for i, rec in enumerate(addr_pins):
-        f.write(" | ((uint32_t)(%s & 1) << %d)" % (_ref(rec), i))
-    f.write(";\n")
-    f.write("\t\t_addr &= (PRESI_ABR_SEQ_ROM_SIZE - 1u);\n")
+    f.write("\t\tstatic uint32_t _seq_addr_q_%s = 0u;\n" % sfx)
+    f.write("\t\tstatic unsigned _seq_en_q_%s = 0u;\n" % sfx)
+    f.write("\t\tuint32_t _addr_cur;\n")
+    f.write("\t\tunsigned _en_cur;\n")
+
+    # Drive data_o from the latched address (the value of addr_i
+    # that was sampled at the last rising edge).
     for i, (c_name, idx) in enumerate(data_pins):
         if idx < 0:
             continue  # data_o bit is tied off in abr_wrap (unused)
         word = i // 32
         bit = i % 32
-        f.write("\t\tpresi_s[%d] = (_en && ((presi_abr_seq_rom[_addr][%d] >> %d) "
-                "& 1u)) ? PRESI_1 : PRESI_0;\n" % (idx, word, bit))
+        f.write("\t\tpresi_s[%d] = (_seq_en_q_%s && ((presi_abr_seq_rom[_seq_addr_q_%s][%d] >> %d) & 1u)) ? PRESI_1 : PRESI_0;\n" %
+                (idx, sfx, sfx, word, bit))
+
+    # Sample current addr_i / en_i for use at the next rising edge.
+    # If en_i is low at the sample point the flop holds its previous Q,
+    # so we keep _seq_addr_q_<sfx> unchanged (and just record en_q).
+    f.write("\t\t_en_cur = ")
+    if en_pins:
+        f.write("%s & 1;\n" % _ref(en_pins[0]))
+    else:
+        f.write("0u;  /* no en_i pin */\n")
+    f.write("\t\t_addr_cur = 0u")
+    for i, rec in enumerate(addr_pins):
+        f.write(" | ((uint32_t)(%s & 1) << %d)" % (_ref(rec), i))
+    f.write(";\n")
+    f.write("\t\t_addr_cur &= (PRESI_ABR_SEQ_ROM_SIZE - 1u);\n")
+    f.write("\t\tif (_en_cur) {\n"
+            "\t\t\t_seq_addr_q_%s = _addr_cur;\n"
+            "\t\t}\n"
+            "\t\t_seq_en_q_%s = _en_cur;\n" % (sfx, sfx))
     f.write("\t}\n")
 
 
@@ -412,17 +446,41 @@ def emit(out_path, instances, srams, seq_meta):
                 " * Body of presi_sram_tick_all().  Each block samples one\n"
                 " * SRAM blackbox instance's input pins from the netlist,\n"
                 " * calls the matching presi_sram_* helper, and writes the\n"
-                " * resulting rdata_o back over the netlist bits.  The\n"
-                " * abr_seq $mem_v2 ROM gets its own block at the end. */\n")
+                " * resulting rdata_o back over the netlist bits. */\n")
         for inst, idx, sram, ports in sorted(sram_blocks, key=lambda b: b[1]):
             emit_sram_block(f, inst, idx, sram, ports)
-        for inst, ports in seq_blocks:
-            emit_seq_block(f, inst, ports, seq_full_width)
         if other:
             f.write("\n\t/* Unwired blackboxes (engines awaiting models):\n")
             for inst, module in other:
                 f.write("\t *   %-12s  %s\n" % (inst, module))
             f.write("\t */\n")
+
+    # Emit the abr_seq tick into a separate header so it can be called at
+    # the flop-tick boundary in presi_cycle, NOT post-settle.  Putting
+    # the seq ROM read at post-settle (as part of sram_tick_all) gave
+    # subtle races: addr_i recomputed during the settle pass differs
+    # from the value that abr_prog_cntr.D was sampled with at the rising
+    # edge, so the registered seq ROM output disagreed with abr_prog_cntr.
+    # See engine_cosim_divergence for the manifestation.
+    seq_out_path = out_path.replace("presi_bb_wiring.h", "presi_seq_tick.h")
+    if seq_out_path == out_path:
+        # Fallback: stick a `.seq` suffix in front of `.h`.
+        seq_out_path = out_path[:-2] + ".seq.h" if out_path.endswith(".h") \
+                       else out_path + ".seq"
+    with open(seq_out_path, "w", encoding="utf-8") as f:
+        f.write("/* Generated by gen_blackbox_wiring.py.  Do not edit.\n"
+                " *\n"
+                " * Body of presi_seq_tick().  Models the abr_seq ROM\n"
+                " * (one synchronous-read flop per data-bit) as a tick\n"
+                " * that fires at the rising edge of clk: reads the\n"
+                " * current addr_i / en_i from presi_s[] (which at the\n"
+                " * call site reflects PRE-flop-tick comb output), and\n"
+                " * drives data_o = ROM[addr] when en_i is high.  Must be\n"
+                " * called between phase-1 comb and step_netlist_flop so\n"
+                " * abr_prog_cntr.D and the seq ROM sample the same\n"
+                " * abr_prog_cntr_nxt comb value. */\n")
+        for inst, ports in seq_blocks:
+            emit_seq_block(f, inst, ports, seq_full_width)
     return len(sram_blocks), len(seq_blocks), len(other)
 
 

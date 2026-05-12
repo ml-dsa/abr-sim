@@ -237,12 +237,11 @@ static void presi_sram_tick_all(struct presi_model *m)
     (void) m;
 #ifdef PRESI_HAVE_NETLIST
     /*
-     * Generated body: one block per blackbox SRAM instance plus an
-     * abr_seq $mem_v2 ROM block.  Each block samples
-     * we_i/waddr_i/wdata_i/re_i/raddr_i (and wstrobe_i for the
-     * byte-enable variant) from presi_s[], calls the matching
-     * presi_sram_* helper, and writes the read result back over the
-     * rdata_o bits.
+     * Generated body: one block per blackbox SRAM instance.  Each
+     * block samples we_i/waddr_i/wdata_i/re_i/raddr_i (and wstrobe_i
+     * for the byte-enable variant) from presi_s[], calls the
+     * matching presi_sram_* helper, and writes the read result back
+     * over the rdata_o bits.
      *
      * Ordering: invoked AFTER the rising-edge step (_flop) and the
      * settle pass in presi_cycle, so SRAM samples its inputs as
@@ -252,6 +251,25 @@ static void presi_sram_tick_all(struct presi_model *m)
      * abr_1r1w_be_ram.
      */
 #include "abr_wrap.presi_bb_wiring.h"
+#endif
+}
+
+/* abr_seq ROM tick.  Models the abr_seq SystemVerilog
+ * `always_ff @(posedge clk) if (en_i) data_o_rom <= ROM[addr_i]`
+ * as a per-cycle flop, sampling addr_i / en_i from current
+ * presi_s[] state.  Must be called at the rising-edge boundary in
+ * presi_cycle -- i.e., AFTER phase-1 comb has settled but BEFORE
+ * step_netlist_flop -- so abr_prog_cntr's D and the seq ROM's D
+ * read the same value of abr_prog_cntr_nxt.  Calling this after
+ * settle (with the SRAM block) reads a transient comb output that
+ * may differ from the value abr_prog_cntr_nxt had at the actual
+ * rising edge, producing a mid-cycle mode flap that prematurely
+ * deasserts ntt_busy.  See engine_cosim_divergence. */
+static void presi_seq_tick(struct presi_model *m)
+{
+    (void) m;
+#ifdef PRESI_HAVE_NETLIST
+#include "abr_wrap.presi_seq_tick.h"
 #endif
 }
 
@@ -301,6 +319,14 @@ void presi_cycle(struct presi_model *m)
     presi_step_netlist_comb();
     presi_engines_step_comb();
     presi_capture_outputs(m);
+
+    /* abr_seq ROM tick.  Snap addr_i / en_i NOW (right before the
+     * flop tick) so the seq ROM's D and abr_prog_cntr.D read the
+     * same value of abr_prog_cntr_nxt.  Sampling at sram_tick (post-
+     * settle) gave a 1-cycle race in which abr_prog_cntr held the
+     * old PC while the seq ROM advanced to ROM[next PC] -- visible
+     * as mode flap mid-NTT and the engine_cosim_divergence. */
+    presi_seq_tick(m);
 
     /* Now tick flops on the rising edge. */
     presi_step_netlist_flop();
@@ -495,6 +521,18 @@ extern presi_t abr_sampler_top__presi_s[];
 #define _SAMPLER_BUSY_O_IDX      2142919
 #define _SAMPLER_STATE_DV_O_IDX  2142176
 #define _SHA3_STATE_DV_IDX       2527635
+/*  ntt_top input pins, post-engine-glue copy.  Reading these
+    tells us what abr_wrap is *actually* delivering to ntt_top each
+    cycle -- key for the engine_cosim_divergence diagnosis. */
+#define _NTT_RESET_N_IDX           48012
+#define _NTT_MLKEM_IDX             48016
+#define _NTT_ZEROIZE_IDX           48023
+#define _NTT_ACCUMULATE_IDX        48168
+#define _NTT_MODE_0_IDX          1385244
+#define _NTT_MODE_1_IDX          1385243
+#define _NTT_MODE_2_IDX          1385241
+#define _NTT_SAMPLER_VALID_IDX   2035762
+#define _NTT_NTT_ENABLE_IDX      2035913
 #endif
 
 void presi_eng_trace_step(struct presi_model *m)
@@ -505,10 +543,23 @@ void presi_eng_trace_step(struct presi_model *m)
     unsigned smp_dv     = abr_sampler_top__presi_s[_SAMPLER_STATE_DV_O_IDX] & 1;
     unsigned sha3_dv    = abr_sampler_top__presi_s[_SHA3_STATE_DV_IDX] & 1;
     unsigned busy_top   = presi_s[IDX_busy_o] & 1;
+    /*  ntt_top inputs as the engine actually sees them (post-glue). */
+    unsigned ntt_en     = ntt_top__presi_s[_NTT_NTT_ENABLE_IDX] & 1;
+    unsigned mlkem      = ntt_top__presi_s[_NTT_MLKEM_IDX]      & 1;
+    unsigned zeroize    = ntt_top__presi_s[_NTT_ZEROIZE_IDX]    & 1;
+    unsigned reset_n    = ntt_top__presi_s[_NTT_RESET_N_IDX]    & 1;
+    unsigned acc        = ntt_top__presi_s[_NTT_ACCUMULATE_IDX] & 1;
+    unsigned smpv       = ntt_top__presi_s[_NTT_SAMPLER_VALID_IDX] & 1;
+    unsigned m0         = ntt_top__presi_s[_NTT_MODE_0_IDX]     & 1;
+    unsigned m1         = ntt_top__presi_s[_NTT_MODE_1_IDX]     & 1;
+    unsigned m2         = ntt_top__presi_s[_NTT_MODE_2_IDX]     & 1;
+    unsigned mode       = m0 | (m1 << 1) | (m2 << 2);
     printf("[eng]\tcyc=%llu  ntt_busy=%u sampler_busy=%u sampler_dv=%u "
-           "sha3_dv=%u busy_o=%u\n",
+           "sha3_dv=%u busy_o=%u  | ntt.in: enable=%u mode=%u mlkem=%u "
+           "zeroize=%u reset_n=%u acc=%u smpv=%u\n",
            (unsigned long long) m->cycle, ntt_busy, smp_busy, smp_dv,
-           sha3_dv, busy_top);
+           sha3_dv, busy_top,
+           ntt_en, mode, mlkem, zeroize, reset_n, acc, smpv);
 #else
     (void) m;
 #endif

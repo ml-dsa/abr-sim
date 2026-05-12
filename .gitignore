@@ -1,5 +1,13 @@
 # project specific
 
+# Verilator binaries (built into project root)
+readvcd
+abr_wrap
+ntt_top_tb
+
+# presi binaries
+presi/ntt_top_standalone
+
 xtest
 __pycache__
 
