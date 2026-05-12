@@ -80,6 +80,18 @@ Hierarchy-focused `readvcd` presets can be passed anywhere a script asks for `<r
 
 The `plot/` directory has a `plot.sh` that turns a tvla output (e.g. `tvla11k.txt`) into the trace/avg/std/tvla gnuplot figures used in `doc/20250530-hardwear-abr.pdf`.
 
+### Engine-handshake trace (`+trace-eng` / `-trace-eng`)
+
+The Verilator `abr_wrap` and the presi cosim both support a per-cycle "engine handshake" trace useful for diagnosing engine co-sim divergence (introduced to find the abr_seq sync-ROM bug — see CLAUDE.md presi section).
+
+- Verilator: `./abr_wrap +trace-eng <op>` — taps `top0.ntt_busy`, `top0.sampler_busy`, `top0.sampler_top_inst.sampler_state_dv_o`, `top0.sampler_top_inst.sha3_state_dv`, `busy_o` via a hierarchical-ref `$display` in `rtl/abr_wrap.sv` (wrapped in `` `ifndef SYNTHESIS `` so sv2v / presi stripping is automatic).  Format: `# <cyc> [eng]  ntt_busy=B sampler_busy=B sampler_dv=B sha3_dv=B busy_o=B`.
+- presi cosim: `./_build/presi-gates-cosim -trace-eng -trace-fsm <op>` — same handshake fields plus an `ntt.in:` panel showing the engine-side input pins after the glue copy (enable, mode, mlkem, zeroize, reset_n, acc, smpv).  Lives in `presi/presi_gates.c::presi_eng_trace_step`.
+- Diff helper: `presi/tools/quick_diff.sh <verilator.log> <presi.log>` produces a [seq] cycle table side-by-side and an [eng] snippet around pc=462 and pc=467 transitions (the historical divergence boundaries).  See `~/.claude/.../engine_cosim_divergence.md` for the canonical post-fix delta table.
+
+### Standalone ntt_top unit testbench
+
+`make ntt_top_tb` builds a Verilator binary (`./ntt_top_tb`) that wraps just `ntt_top` and drives a single PWA opcode pulse against quiescent inputs (`rtl/ntt_top_tb.sv` + `src/ntt_top_tb.cpp`).  Useful as a golden-reference unit harness: 70 cy PWA at the port boundary regardless of context.  Its presi-side counterpart is `presi/ntt_top_standalone.c` (compiled separately by hand: link against `_build/ntt_top.presi_*.o` files) — drives `ntt_top__presi_s[]` directly with the same stimulus, useful for confirming the gates-C model in isolation.
+
 ## Reference docs
 
 - `doc/mldsa_fsm.md` and `doc/mlkem_fsm.md` annotate every `[seq]` marker emitted by `rtl/abr_seq_decode.sv`, mapping each FSM address (and its range-decoded `+offs` form) to the executed `ABR_UOP_*` opcode and the matching FIPS 204 / FIPS 203 algorithm + line. Use these when interpreting `[seq]` lines in a run log or relating an `abr_seq.sv` ROM slot to the standardized pseudocode. Cycle counts in the example traces are illustrative — `abr_wrap`'s AHB-setup window varies the absolute values; addresses and names are the stable part.
@@ -114,7 +126,7 @@ Build entry points:
 
 `GATES_OPT` Makefile knob defaults to `-O0` (5.7 s per part .c, ~12 min clean rebuild).  `-O1` is tractable post-array-layout (1m57s per part .c, ~24 min rebuild) but isn't the default.
 
-Six load-bearing details that are easy to break:
+Seven load-bearing details that are easy to break:
 
 1. **Yosys ≥ 0.64 is required.**  Older 0.36's `proc` is 5–10× slower on this design (25+ minute hangs on the `proc_mux` step over abr_ctrl's FSM).  The newer release also has lower peak memory.
 2. **Use `opt`, not `opt_clean`, after `proc` in the gates flow.** sv2v leaves parameter expressions like `$clog2(MLDSA_Q)+1` as runtime arithmetic.  Without full `opt`, abr_wrap carries ~1200 spurious `$mul` cells that techmap then expands to millions of gates and OOMs the box.
@@ -122,6 +134,7 @@ Six load-bearing details that are easy to break:
 4. **No ABC, no BUF/NAND lowering.** Both ran the inlined abr_wrap into swap.  `spice_to_c.py` handles Yosys's gate primitives directly.
 5. **DFFs are edge-triggered with `presi_clk_prev`, comb is topo-sorted.**  Each `$_DFF_P_`/`$_DFFSR_PPP_` cell emits as `if ((presi_s[<clk>] & ~presi_clk_prev & 1)) presi_s[<Q>] = presi_s[<D>];` so the flop only ticks on a true 0→1 transition regardless of how many `presi_step_netlist()` calls happen per phase.  Combinational statements within a part file are ordered by dataflow (Kahn's topo sort over (writer, reader) of comb nets, with reads of flop outputs treated as stable inputs).  Together these give a correct one-step-per-phase cycle without re-clocking the flops or reading stale comb values.
 6. **Snapshot save/load saves the whole `presi_s[]` array verbatim, but the load path always runs `presi_settle_after_load()` after restore.** That settle is one comb-only `presi_step_netlist()` call (clock unchanged, so no flops tick).  This makes the format tolerant of "flop-only" snapshots — a future Python writer can leave comb wires at zero and they will become consistent on the first step.  The harness owns the settle; never skip it after a load.
+7. **abr_seq is modeled as a synchronous (1-cycle) flop ROM, NOT combinational.**  `gen_blackbox_wiring.py::emit_seq_block` emits the seq tick into a separate generated header `<top>.presi_seq_tick.h` (NOT the SRAM `bb_wiring.h`).  `presi_gates.c::presi_cycle` calls `presi_seq_tick()` between phase-1 comb and `step_netlist_flop()` so abr_prog_cntr.D and the seq ROM's "address sample" both latch the same `abr_prog_cntr_nxt` comb value at the rising edge.  Per-instance static slots `_seq_addr_q_<inst>` / `_seq_en_q_<inst>` carry the registered Q across cycles.  Reverting this to a 0-cycle combinational read (read addr_i NOW, drive data_o NOW) creates a comb feedback loop `data_o → mode → ntt_busy → abr_prog_cntr_nxt → addr_i → data_o` that lets engine ops finish early under mode-change boundaries — visible as mlkem-keygen pc=462 NTT shortening to 234 cy and pc=467 PWA collapsing to 3 cy with pc=468 deadlocking.  See `~/.claude/.../engine_cosim_divergence.md`.
 
 Don't add an `if (!busy_o) return;` skip to `presi_engines_step()`.  That gate stalls the engines on the cycle after `MLDSA_CTRL=1` was written -- `busy_o` lags by one cycle, so the engines miss the first edge where the controller drives sampler inputs.  Re-introduce only with explicit clk_prev maintenance during the skipped phases.
 
@@ -145,8 +158,8 @@ detail.  Quick examples:
 presi/tools/snapshot-roundtrip.sh
 ```
 
-Six load-bearing details (one for the snapshot bit) added to the list
-below.
+Seven load-bearing details (one for the snapshot bit, one for the
+abr_seq synchronous-ROM model) added to the list below.
 
 ## Default file conventions
 

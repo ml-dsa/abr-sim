@@ -574,3 +574,4 @@ run-gates: $(PRESI_GATES)
 
 clean:
 	$(RM) -rf $(BUILD)
+	$(RM) -f  ntt_top_standalone presi-cosim presi-gates presi-gates-cosim

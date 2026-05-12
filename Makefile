@@ -104,7 +104,8 @@ $(BUILD):
 #       cleanup
 
 clean:
-	$(RM)   -f	$(READVCD) $(MLDSA_WRAP) $(ABR_WRAP) *.vcd *.dat *.log
+	$(RM)   -f	$(READVCD) $(MLDSA_WRAP) $(ABR_WRAP) $(NTT_TB) \
+		*.vcd *.dat *.log
 	$(RM)   -rf $(BUILD) _tr* */__pycache__
 	cd plot && $(MAKE) clean
 	cd presi && $(MAKE) clean
