@@ -146,6 +146,8 @@ static const char usage[] =
     "  -save <fn>    save snapshot at end\n"
     "  -init-only    stop after CTRL write (useful with -save)\n"
     "  -no-output    skip writing output .dat files\n"
+    "  -trace-fsm    print [seq] cyc=N pc=M lines on FSM PC transitions\n"
+    "  -trace-eng    print [eng] cyc=N ... line every cycle\n"
     "  -h, --help    this message\n";
 
 static int parse_argv(int argc, char **argv, struct slots *s,
@@ -203,6 +205,8 @@ static int parse_argv(int argc, char **argv, struct slots *s,
             s->no_output = 1; i += 1;
         } else if (strcmp(a, "-trace-fsm") == 0) {
             presi_fsm_trace_enabled = 1; i += 1;
+        } else if (strcmp(a, "-trace-eng") == 0) {
+            presi_eng_trace_enabled = 1; i += 1;
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             puts(usage); return -1;
         } else if (*op_name == NULL && a[0] != '-') {

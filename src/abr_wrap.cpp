@@ -265,7 +265,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    //  pass plusargs (e.g. +trace-eng) through to Verilator so
+    //  $test$plusargs works inside the SV.
+    Verilated::commandArgs(argc, argv);
+
     for (int i = 1; i < argc;) {
+        if (argv[i][0] == '+') {
+            //  consumed by Verilated::commandArgs above
+            i += 1;
+            continue;
+        }
         if (i + 1 < argc && strcmp(argv[i], "-t") == 0) {
             max_cycle = strtoll(argv[i + 1], NULL, 0);
             i += 2;

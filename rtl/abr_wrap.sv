@@ -77,4 +77,26 @@ module abr_wrap
         .notif_intr     (   notif_intr  )
     );
 
+`ifndef SYNTHESIS
+    //  --- engine-signal trace, simulation-only.
+    //      gate-synthesis flow (sv2v -D SYNTHESIS) strips this block.
+    //      Reads engine handshakes via hierarchical reference into
+    //      top0; opt-in via +trace-eng on the Verilator binary.
+    logic eng_trace_en = 1'b0;
+    logic [25:0] eng_cyc = 0;
+    initial begin
+        if ($test$plusargs("trace-eng")) eng_trace_en = 1'b1;
+    end
+    always_ff @(posedge clk) begin
+        if (rst_b && eng_trace_en) begin
+            $display("#%d [eng]  ntt_busy=%b sampler_busy=%b sampler_dv=%b sha3_dv=%b busy_o=%b",
+                eng_cyc, top0.ntt_busy, top0.sampler_busy,
+                top0.sampler_top_inst.sampler_state_dv_o,
+                top0.sampler_top_inst.sha3_state_dv,
+                busy_o);
+        end
+        eng_cyc <= eng_cyc + 1;
+    end
+`endif
+
 endmodule

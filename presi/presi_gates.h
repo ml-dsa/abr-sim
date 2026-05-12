@@ -120,6 +120,15 @@ size_t write_dat(const uint32_t *buf, size_t bufsz, const char *fn);
 extern int presi_fsm_trace_enabled;
 int presi_fsm_trace_step(struct presi_model *m, int *prev_pc);
 
+/* ---- Engine handshake trace.  When `presi_eng_trace_enabled` is
+ * non-zero, the status-poll loop prints one `[eng] cyc=N ...` line
+ * per cycle showing ntt_busy / sampler_busy_o / sampler_state_dv_o /
+ * sha3_state_dv / busy_o.  Same Verilator-side format lives in
+ * rtl/abr_wrap.sv (-trace-eng plusarg), so logs are head-to-head
+ * diff-able when investigating engine cycle-count divergence. */
+extern int presi_eng_trace_enabled;
+void presi_eng_trace_step(struct presi_model *m);
+
 /* ---- High-level orchestration: ML-DSA-87 keygen.
  * Each phase callable independently, so one binary can run only the
  * AHB-init phase (snapshot save), or only the wait phase (snapshot

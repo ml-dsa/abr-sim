@@ -478,6 +478,42 @@ int presi_fsm_trace_step(struct presi_model *m, int *prev_pc)
 #endif
 }
 
+/* Engine handshake trace: emit one [eng] line per cycle showing the
+ * controller-visible engine output signals (ntt_busy, sampler_busy_o,
+ * sampler_state_dv_o, sha3_state_dv).  These are the four signals
+ * abr_ctrl polls when deciding the next FSM step (see abr_ctrl.sv
+ * lines 1528, 2021); they're the proximate cause of cycle-count
+ * divergence between presi and Verilator.  The output format mirrors
+ * the Verilator $display in rtl/abr_wrap.sv so logs can be diff'd
+ * head-to-head.  Indices come from the per-engine presi_map.csv. */
+int presi_eng_trace_enabled = 0;
+
+#if defined(PRESI_HAVE_NETLIST) && defined(PRESI_HAVE_ENGINE_NETLISTS)
+extern presi_t ntt_top__presi_s[];
+extern presi_t abr_sampler_top__presi_s[];
+#define _NTT_BUSY_IDX            2780252
+#define _SAMPLER_BUSY_O_IDX      2142919
+#define _SAMPLER_STATE_DV_O_IDX  2142176
+#define _SHA3_STATE_DV_IDX       2527635
+#endif
+
+void presi_eng_trace_step(struct presi_model *m)
+{
+#if defined(PRESI_HAVE_NETLIST) && defined(PRESI_HAVE_ENGINE_NETLISTS)
+    unsigned ntt_busy   = ntt_top__presi_s[_NTT_BUSY_IDX] & 1;
+    unsigned smp_busy   = abr_sampler_top__presi_s[_SAMPLER_BUSY_O_IDX] & 1;
+    unsigned smp_dv     = abr_sampler_top__presi_s[_SAMPLER_STATE_DV_O_IDX] & 1;
+    unsigned sha3_dv    = abr_sampler_top__presi_s[_SHA3_STATE_DV_IDX] & 1;
+    unsigned busy_top   = presi_s[IDX_busy_o] & 1;
+    printf("[eng]\tcyc=%llu  ntt_busy=%u sampler_busy=%u sampler_dv=%u "
+           "sha3_dv=%u busy_o=%u\n",
+           (unsigned long long) m->cycle, ntt_busy, smp_busy, smp_dv,
+           sha3_dv, busy_top);
+#else
+    (void) m;
+#endif
+}
+
 /* ============================================================
  * Status polling
  * ============================================================ */
@@ -499,6 +535,9 @@ static int wait_for_status_addr(struct presi_model *m, uint32_t status_addr,
         st = ahb_read(m, status_addr);
         if (presi_fsm_trace_enabled) {
             (void) presi_fsm_trace_step(m, &prev_pc);
+        }
+        if (presi_eng_trace_enabled) {
+            presi_eng_trace_step(m);
         }
         if (verbose && (int) st != prev) {
             printf("[STAT]\tcycle=%llu  status=%08x%s%s%s\n",
@@ -524,6 +563,9 @@ static int wait_for_status_addr(struct presi_model *m, uint32_t status_addr,
                 presi_cycle(m);
                 if (presi_fsm_trace_enabled) {
                     (void) presi_fsm_trace_step(m, &prev_pc);
+                }
+                if (presi_eng_trace_enabled) {
+                    presi_eng_trace_step(m);
                 }
             }
         }
