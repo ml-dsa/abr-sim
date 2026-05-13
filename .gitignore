@@ -8,6 +8,8 @@ ntt_top_tb
 # presi binaries
 presi/ntt_top_standalone
 
+*.dat
+
 xtest
 __pycache__
 
